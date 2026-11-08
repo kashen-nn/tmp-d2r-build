@@ -310,6 +310,9 @@ HLE_FORCE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", "fsp-srv；存档目�
 //   小地图（放右上角：迷你、半透明）：
 //   "AutoMapMode": 2 = 微缩地图放右（0 全屏 / 1 放左 / 2 放右，游戏缺省也是 2，这里写明）；透明度（AutoMapFade）不补、用游戏缺省 0 = 不淡化——选「全部」（3）时小地图的线条淡到几乎只剩文字，地图本来就是叠在画面上的线条，不淡化也透得过去；
 //   "AutoMap Open On Load": 1 = 进局自动开启（游戏缺省 0）。点小地图 = 地图开关键，见 front_ios.m。
+//   用户指定的缺省（2026-11，同样只补缺、已有的键不动）：
+//   "Always Run": 0、"Lobby Difficulty": 0、"Offline Difficulty Scaling": 1、"Tutorial": 1、"Vfx Lighting Quality": 0（特效灯光质量最低档，省帧率）。
+//   语言两键不在这张补缺表里：只在首次安装（没有设置文件）时写死 "Language": 8、"VoiceLanguage": 8，见 settings_seed 函数内。
 // iOS 包缺省做；Mac 宿主缺省不做（闸门对 Switch 真值比图），DM_TOUCH_DEFAULTS=1 开 / =0 关。
 // 共享仓库预置：存档目录里没有 ModernSharedStashSoftCoreV2/ModernSharedStashSoftCoreV2.d2i 时写入预置文件（stash_seed.h），已有的一个字节不动。
 // 在挂存档、克隆出工作目录之前做，所以游戏第一次读到的就是它。iOS 上缺省开、DM_STASH_SEED=0 关掉；Mac 宿主缺省关、DM_STASH_SEED=1 打开。
@@ -323,6 +326,9 @@ HLE_FORCE("_ZN2nn2fs14EnsureSaveDataERKNS_7account3UidE", "fsp-srv；存档目�
 //   Minimap (placed top right: mini, semi-transparent):
 //   "AutoMapMode": 2 = mini map on the right (0 full screen / 1 left / 2 right, the game default is also 2, stated here explicitly); opacity (AutoMapFade) is not filled in, the game default 0 = no fade is used -- with 「全部」(All) (3) the minimap lines fade until almost only the text remains; the map is lines overlaid on the picture anyway, so it shows through without fading;
 //   "AutoMap Open On Load": 1 = open automatically on entering a run (game default 0). Tapping the minimap = the map toggle key, see front_ios.m.
+//   User-specified defaults (2026-11, likewise fill-only, existing keys untouched):
+//   "Always Run": 0, "Lobby Difficulty": 0, "Offline Difficulty Scaling": 1, "Tutorial": 1, "Vfx Lighting Quality": 0 (lowest VFX lighting quality, saves frame rate).
+//   The two language keys are not in this fill-in table: they are pinned to "Language": 8 / "VoiceLanguage": 8 only on first install (no settings file), see inside settings_seed.
 // Done by default in the iOS app; not done by default on the Mac host (gate checks compare images against Switch ground truth), DM_TOUCH_DEFAULTS=1 on / =0 off.
 // Shared stash seed: when the save directory has no ModernSharedStashSoftCoreV2/ModernSharedStashSoftCoreV2.d2i, write the seed file (stash_seed.h); an existing one is not changed by a single byte.
 // Done before mounting the save and cloning the working directory, so it is what the game reads the first time. On by default on iOS, DM_STASH_SEED=0 turns it off; off by default on the Mac host, DM_STASH_SEED=1 turns it on.
@@ -371,7 +377,9 @@ static int voice_for(int lang) { return lang == 8 ? 8 : lang == 7 && voice_chunk
 static void settings_seed(const char *save_dir) {
     const char *e = getenv("DM_TOUCH_DEFAULTS"); int on = e ? strcmp(e, "0") != 0 : DM_PHONE; if (!on) return;
     static const char *kv[][2] = {{"\"Item Name Display\"", "1"}, {"\"Item Tooltip Hotkey Appender\"", "0"},
-                                  {"\"AutoMapMode\"", "2"}, {"\"AutoMap Open On Load\"", "1"}};
+                                  {"\"AutoMapMode\"", "2"}, {"\"AutoMap Open On Load\"", "1"},
+                                  {"\"Always Run\"", "0"}, {"\"Lobby Difficulty\"", "0"}, {"\"Offline Difficulty Scaling\"", "1"},
+                                  {"\"Tutorial\"", "1"}, {"\"Vfx Lighting Quality\"", "0"}};
     char dir[1100], path[1200]; snprintf(dir, sizeof dir, "%s/Settings", save_dir); snprintf(path, sizeof path, "%s/Settings.json", dir);
     static char buf[65536], out[66000]; size_t n = 0; FILE *f = fopen(path, "rb");   // static：挂存档的游戏线程栈小（两块 64 KB 放栈上直接越栈，实测崩）；挂存档只在一个线程上做 | static: the game thread that mounts the save has a small stack (two 64 KB blocks on the stack overflow it outright, measured crash); mounting the save is done on one thread only
     int first = f == NULL;   // 没有设置文件 = 首次安装 | no settings file = first install
@@ -380,9 +388,11 @@ static void settings_seed(const char *save_dir) {
     char *brace = strchr(buf, '{'); int had = brace != NULL; size_t o = 0; int added = 0;
     o += (size_t)snprintf(out + o, sizeof out - o, "{");
     for (size_t i = 0; i < sizeof kv / sizeof kv[0]; i++) if (!strstr(buf, kv[i][0])) { o += (size_t)snprintf(out + o, sizeof out - o, "\n    %s: %s,", kv[i][0], kv[i][1]); added++; }
-    // 首次安装按系统语言定原版的文字语言和语音语言（dm_sys_lang()，见 dm_i18n.c；只在没有设置文件时）。已有设置文件不补这两个键（老玩家照旧）；之后由自定义页的语言开关改（settings_lang_apply）
-    // On first install the original game's text and voice languages are set from the system language (dm_sys_lang(), see dm_i18n.c; only when there is no settings file). An existing settings file does not get these two keys added (existing players stay as they are); afterwards they are changed by the language switch on the Custom page (settings_lang_apply)
-    if (first) { int dm_sys_lang(void), sl = dm_sys_lang(); o += (size_t)snprintf(out + o, sizeof out - o, "\n    \"Language\": %d,\n    \"VoiceLanguage\": %d,", sl, voice_for(sl)); added += 2; }
+    // 首次安装写用户指定的缺省语言：文字 = 简体中文（8）、配音 = 简中配音（8），不再跟系统语言（只在没有设置文件时）。已有设置文件不补这两个键（老玩家照旧）；
+    // 之后若 sw_custom 里有玩家明确选过的语言/配音，settings_lang_apply 每次挂存档时以它为准（明确选择 > 这里的首次缺省），见该函数
+    // On first install, write the user-specified default languages: text = Simplified Chinese (8), voice = Simplified Chinese voice (8), no longer following the system language (only when there is no settings file). An existing settings file does not get these two keys added (existing players stay as they are);
+    // afterwards, if sw_custom holds an explicit language/voice choice made by the player, settings_lang_apply applies it on every save mount (explicit choice > this first-install default), see that function
+    if (first) { o += (size_t)snprintf(out + o, sizeof out - o, "\n    \"Language\": 8,\n    \"VoiceLanguage\": 8,"); added += 2; }
     if (!added) return;
     if (had) { const char *rest = brace + 1; const char *q = rest; while (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t') q++;
         if (*q == '}') { out[o - 1] = 0; o--; }   // 原文件是空对象：去掉补的最后一个逗号 | the original file is an empty object: remove the last comma that was added
@@ -391,7 +401,7 @@ static void settings_seed(const char *save_dir) {
     mkdir(dir, 0755); char tmp[1300]; snprintf(tmp, sizeof tmp, "%s.seed", path);
     f = fopen(tmp, "wb"); if (!f || fwrite(out, 1, o, f) != o) { if (f) fclose(f); LOG("【红】设置缺省：写 %s 失败", tmp); return; }
     fclose(f); if (rename(tmp, path)) { LOG("【红】设置缺省：改名到 %s 失败", path); return; }
-    LOG("设置缺省：%s 补了 %d 个键（显示物品 = 开关式 / 说明条热键 = 关 / 小地图放右、进局自动开%s；已有的键不动）", path, added, first ? " / 首次安装按系统语言写 Language" : "");
+    LOG("设置缺省：%s 补了 %d 个键（显示物品 = 开关式 / 说明条热键 = 关 / 小地图放右、进局自动开 / 特效灯光质量 = 0%s；已有的键不动）", path, added, first ? " / 首次安装写 Language = 8、VoiceLanguage = 8" : "");
 }
 // 语言开关（自定义页标题行那一格，dm_custom.c 的 lang：0 中文 / 1 English / 2 Español / 3 Русский / 4 한국어 / 5 Português）：玩家点过「应用」后设置文件里有明确的值，每次挂存档（游戏读设置之前）
 // 按它把原版设置文件的 Language（文字）和 VoiceLanguage（语音，语音跟着切，见 voice_for）改好。只在「与开关不符」时改：
