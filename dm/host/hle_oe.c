@@ -157,9 +157,9 @@ HLE_FORCE("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", "前后台
 // (the Mac has no present timestamps, so this verifies the whole downgrade / recovery chain). Active only in-game (no judging outside a game); the first level drops after a full 10 s (5 windows).
 #include <TargetConditionals.h>
 // 3D 比例的档位表：0 档 = 配置值（iPhone 0.75），往下依次是表里低于配置值的各档（每档 0.05）；下限由 DM_3D_SCALE_FLOOR（缺省见 S3_FLOOR_DEF）截断。
-// 配置值 0.75 时档位仍是 0.75 / 0.70 / 0.65 / 0.60；配得更高（如 DM_3D_SCALE=0.85）时中间多出 0.80、0.75 两档，重场景一档档往下退。只动 3D 渲染比例，界面和文字不降
+// 配置值 0.75 时档位仍是 0.75 / 0.70 / 0.65 / 0.60 / 0.55 / 0.50；配得更高（如 DM_3D_SCALE=0.85）时中间多出 0.80、0.75 两档，重场景一档档往下退。只动 3D 渲染比例，界面和文字不降
 // 3D scale level table: level 0 = configured value (iPhone 0.75), then in order the table's scales below the configured value (0.05 apart); the floor is clamped by DM_3D_SCALE_FLOOR (default: see S3_FLOOR_DEF).
-// With the configured 0.75 the levels stay 0.75 / 0.70 / 0.65 / 0.60; a higher setting (e.g. DM_3D_SCALE=0.85) gains 0.80 and 0.75 in between, so heavy scenes step down one level at a time. Only the 3D render scale changes; UI and text are not lowered
+// With the configured 0.75 the levels stay 0.75 / 0.70 / 0.65 / 0.60 / 0.55 / 0.50; a higher setting (e.g. DM_3D_SCALE=0.85) gains 0.80 and 0.75 in between, so heavy scenes step down one level at a time. Only the 3D render scale changes; UI and text are not lowered
 static const float g_s3_levels[] = {0.95f, 0.90f, 0.85f, 0.80f, 0.75f, 0.70f, 0.65f, 0.60f, 0.55f, 0.50f};
 #define S3_NLV ((int)(sizeof g_s3_levels / sizeof g_s3_levels[0]))
 // 第 lv 档的比例：0 = 配置值，lv ≥ 1 = 表里第 lv 个低于配置值的比例（超出取最低的那个）
@@ -201,7 +201,7 @@ static float s3_cfg(void) {
     float s = atomic_load(&g_s3_set);
     return DM_PHONE ? (s > 0 ? s : s3_phone_default()) : 1.0f;
 }
-#define S3_FLOOR_DEF 0.60f   // 待真机扫档（热机稳态最后 30 秒掉帧 ≤ 1%）定 | To be set by a device level sweep (dropped frames ≤ 1% in the last 30 s of warm steady state)
+#define S3_FLOOR_DEF 0.50f   // 待真机扫档（热机稳态最后 30 秒掉帧 ≤ 1%）定 | To be set by a device level sweep (dropped frames ≤ 1% in the last 30 s of warm steady state)
 // 纯函数控制器（单测 t_oe.c 直接喂序列）：level 0 = 配置值，越大越低。判据只认实际上屏：
 //   掉帧 = 上屏间隔 > 1.5 × 目标周期（60 帧时 25 ms），或被系统丢弃（−1）；每 2 秒一个窗，记窗内帧数与掉帧数，留最近 30 窗（60 秒）。
 //   降：最近 5 窗（10 秒）掉帧率 > 5%（快：重场景一来就降），或最近 30 窗（60 秒）掉帧率 > 1.5%（慢：长期小掉帧也降）→ 降一档，停判 3 秒、窗记录清空。
@@ -341,8 +341,8 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
     { static int was; int in = dm_ingame_now();   // 不在局内（菜单 / 读取）不判；刚进局的 20 秒也不判（进局头十几秒的慢帧是装载，不是 GPU 吃紧） | not judged outside a run (menu / loading); not judged in the first 20 seconds of a run either (slow frames in the first ten-odd seconds of a run are loading, not GPU pressure)
       if (!in) { was = 0; scale3d_ctl_hold(&c, now, S3_SEC); return; }
       if (!was) { was = 1; if (inj0 < 0) scale3d_ctl_hold(&c, now, 20 * S3_SEC); } }
-    { int mtl_fps_target(void); double mtl_display_refresh(void), dm_pace_hz(double, double), r = mtl_display_refresh(), hz = dm_pace_hz(r, 60);
-      double p = mtl_fps_target() == 30 ? 1000.0 / dm_pace_hz(r, 30) : hz != 60 ? 1000.0 / hz : 0; if (p != c.period_ms) { c.period_ms = p; scale3d_ctl_hold(&c, now, 2 * S3_SEC); } }   // 目标周期跟着出图帧率换（省电 30 帧、非 60 倍数的屏取整除档，如 144 Hz 屏 72），切换后停判 2 秒 | The target period follows the present frame rate (power saving 30 fps; screens not a multiple of 60 take the evenly dividing tier, e.g. 72 on a 144 Hz screen); checking pauses for 2 seconds after a switch
+    { int mtl_fps_target(void); double mtl_display_refresh(void), dm_pace_hz(double, double), r = mtl_display_refresh(); int tgt = mtl_fps_target(); double hz = dm_pace_hz(r, 60);
+      double p = (tgt == 50 || tgt == 55) ? 1000.0 / tgt : tgt != 60 ? 1000.0 / dm_pace_hz(r, tgt) : hz != 60 ? 1000.0 / hz : 0; if (p != c.period_ms) { c.period_ms = p; scale3d_ctl_hold(&c, now, 2 * S3_SEC); } }   // 目标周期跟着帧率目标换：30 / 40 锁定档各按自己的周期判（旧式只认 30，40 档回落到 60 帧的 16.7 ms 周期，正常的 25 ms 帧全在掉帧阈值边缘、窗内计数失真）；50 / 55 非整除档没有整除档可取（dm_pace_hz 会把 50 / 55 抬到 60、周期变回 16.7 ms，交替出现的 25.01 ms 正常长间隔会被当掉帧），直接按真实目标周期判（50 → 20.0 ms、55 → 18.18 ms；软节拍下间隔在 16.67 / 25.01 ms 间交替，1.5 倍周期分别是 30 / 27.3 ms，长间隔不误判）；非 60 倍数的屏取整除档（如 144 Hz 屏 72），切换后停判 2 秒。软节拍（nvn_mtl 模式 3）下上屏间隔 = 产帧跨度按一个刷新粒度取整，节拍等待只出现在帧提前备好时、不会把间隔拉过周期，所以按 1.5 倍周期判掉帧即是按产帧耗时判 | The target period follows the frame-rate target: the 30 / 40 locks are each judged by their own period (the old form only knew 30, so a 40 lock fell back to the 60 fps period of 16.7 ms, leaving normal 25 ms frames right at the drop threshold and distorting the window counts); the 50 / 55 non-divisor tiers have no divisor tier to take (dm_pace_hz would raise 50 / 55 to 60 and the period would fall back to 16.7 ms, counting the alternating normal 25.01 ms long intervals as drops), so they are judged by the real target period (50 -> 20.0 ms, 55 -> 18.18 ms; under soft pacing the intervals alternate between 16.67 and 25.01 ms, and 1.5x the period is 30 / 27.3 ms, so the long intervals are not miscounted); screens not a multiple of 60 take the evenly dividing tier (e.g. 72 on a 144 Hz screen); checking pauses for 2 seconds after a switch. Under soft pacing (nvn_mtl mode 3) the present interval is the frame production span rounded to one refresh of granularity, and pacing wait only appears when a frame was ready early and never stretches an interval past the period, so judging drops at 1.5x the period is judging by production cost
     if (inj0 >= 0) { long f = (long)dm_nvn_frame_count(); double per = c.period_ms > 0 ? c.period_ms : 1000.0 / 60; iv_ms = f >= inj0 && f <= inj1 ? 2 * per : per; }   // 注入：段内每帧当掉一帧（两个周期） | Injection: every frame within the segment counts as a dropped frame (two periods)
     int was = c.level, lv = scale3d_ctl_step(&c, iv_ms, now);
     if (lv != was) LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%% → %s到第 %d 档（3D 比例 %.2f）%s", c.last_r10 * 100, c.last_r60 * 100, lv > was ? "降" : "升", lv,
@@ -352,6 +352,16 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
 void dm_3d_scale_hot(int hot) { (void)hot; }   // 过热不再直接降档（改按实际掉帧）；保留符号给前端 | overheating no longer lowers the level directly (now by actual dropped frames); the symbol is kept for the front end
 static _Atomic float g_scale3d_cur = 1.0f;
 float dm_3d_scale_cur(void) { return atomic_load(&g_scale3d_cur); }
+// 游戏内菜单的手动 3D 比例（launcher-spatial-menu）：0 = 自动（控制器说了算），0.50–1.00 = 手动锁定。
+// 只写一个原子变量，真正重建 3D 目标的仍是 scale3d_tick（游戏取通知的上下文，见上面注释），所以不会在出图路径里
+// 自锁；手动锁定期间控制器的档位变化被忽略（不会被“调回去”），选回自动后控制器立即接管（cur 与 dyn 不一致即重建）。
+// In-game menu manual 3D scale: 0 = auto (controller decides), 0.50–1.00 = manual lock.
+// Only an atomic is written; the actual 3D-target rebuild stays in scale3d_tick (the notification-fetch context, see above),
+// so no self-deadlock in the present path. While manual is set, controller level changes are ignored (never overridden back);
+// back to auto, the controller resumes immediately (a cur/dyn mismatch rebuilds).
+static _Atomic float g_scale3d_manual;
+void dm_3d_scale_manual_set(float v) { atomic_store(&g_scale3d_manual, (v >= 0.50f && v <= 1.00f) ? v : 0.0f); }
+float dm_3d_scale_manual_get(void) { return atomic_load(&g_scale3d_manual); }
 static void scale3d_tick(void) {
     static float cur = 1.0f; static module_t *main; static int found;
     if (!found) { found = 1; for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main")) main = &g_mod[i]; }
@@ -362,7 +372,9 @@ static void scale3d_tick(void) {
     // Dynamic level: 0 = configured value, k = the k-th table scale below the configured value
     int lv = atomic_load(&g_scale3d_level); float dyn = s3_level_scale(want_cfg, lv);
     if (s3g_on()) { float g = atomic_load(&g_s3g_scale); dyn = g > 0 && g < want_cfg ? g : want_cfg; }   // GPU 时间控制器（DM_3D_SCALE_GPU=1，鸿蒙缺省开）覆盖帧间隔档 | GPU-time controller (DM_3D_SCALE_GPU=1, on by default on HarmonyOS) overrides the frame-interval level
-    float want = dm_nvn_ruler_truth() ? 1.0f : dyn;
+    float man = atomic_load(&g_scale3d_manual); int ruler = dm_nvn_ruler_truth(); float want = ruler ? 1.0f : (man > 0 ? man : dyn);
+    if (!ruler && atomic_load(&g_3d_quality_mode) != 1) { int mtl_fps_target(void); int tgt = mtl_fps_target();   // 锁帧封顶：流畅优先下锁 30 / 40 / 50 / 55 时实际比例封顶（30 → 0.80、40 → 0.85、50 → 0.90、55 → 0.95），手动清晰度与动态档一并受限——锁帧就是要保住帧时间，比例顶在 1.00 时重场景 GPU 单帧成本必然溢出周期（23.1 真机：控制器已降到第 1–3 档，实际比例被手动 1.00 压住不生效，重场景一路溢出）；画质优先是用户明确要画质，不封顶 | Lock ceiling: under smoothness-first, a 30 / 40 / 50 / 55 lock caps the applied scale (30 -> 0.80, 40 -> 0.85, 50 -> 0.90, 55 -> 0.95), for the manual clarity value and the dynamic level alike -- a frame-rate lock exists to protect frame time, and at scale 1.00 the per-frame GPU cost in heavy scenes necessarily overflows the period (23.1 device log: the controller had stepped down to levels 1-3 while the applied scale stayed pinned at the manual 1.00, overflowing all the way through the heavy scene); quality-first is an explicit user choice for quality and is not capped
+        if (tgt == 30 || tgt == 40 || tgt == 50 || tgt == 55) { float cap = tgt == 30 ? 0.80f : tgt == 40 ? 0.85f : tgt == 50 ? 0.90f : 0.95f; if (want > cap) want = cap; } }
     if (want == cur || !main || dm_nvn_frame_count() < 30) return;
     uintptr_t renderer = *(uintptr_t *)(main->base + 0x31e0848); if (!renderer) return;
     uint32_t ow = *(uint32_t *)(renderer + 0xee88), oh = *(uint32_t *)(renderer + 0xee8c); if (!ow || !oh) return;

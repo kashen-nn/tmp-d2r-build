@@ -2548,6 +2548,148 @@ static MTLSamplerAddressMode wrapm(int w) {
         case 6: return MTLSamplerAddressModeMirrorRepeat; }
     return MTLSamplerAddressModeRepeat;
 }
+// 各向异性过滤（launcher-spatial-menu）：启动器定初始值（DM_ANISO 环境变量），游戏内菜单运行中改。
+// 档位：-1 跟随游戏原值，1 = 关，2 / 4 / 8 / 16 = 强制档位（不是上限：选 8x 则所有采样器都按 8x 建）。
+// Anisotropic filtering: the launcher sets the initial value (DM_ANISO env); the in-game menu changes it live.
+// Levels: -1 = follow the game's value, 1 = off, 2 / 4 / 8 / 16 = forced level (not a cap: 8x builds every sampler at 8x).
+static _Atomic int g_dm_aniso = -2;   // -2 未初始化（首次读 DM_ANISO），-1 跟随，1/2/4/8/16 强制
+static int dm_aniso_mode(void) {
+    int v = atomic_load(&g_dm_aniso);
+    if (v != -2) return v;
+    const char *e = getenv("DM_ANISO"); int m = -1;
+    if (e) { if (!strcmp(e, "off") || !strcmp(e, "0") || !strcmp(e, "1")) m = 1;
+        else if (!strcmp(e, "2")) m = 2; else if (!strcmp(e, "4")) m = 4;
+        else if (!strcmp(e, "8")) m = 8; else if (!strcmp(e, "16")) m = 16; }
+    atomic_store(&g_dm_aniso, m); return m;
+}
+void dm_aniso_set(int v) { atomic_store(&g_dm_aniso, (v == 1 || v == 2 || v == 4 || v == 8 || v == 16) ? v : -1); }
+int dm_aniso_get(void) { return dm_aniso_mode(); }
+// 立即生效：作废全部已建采样器缓存（持 g_rmu，与编码互斥）；旧对象走延迟释放（defer_obj_unref：
+// 等在途提交完成后再放引用、不动驻留集——采样器从未进驻留集，见 res_add 调用点），下一次使用时按新档位重建。
+// Takes effect immediately: invalidates every built sampler cache (under g_rmu, mutually exclusive with encoding);
+// old objects are released deferred (defer_obj_unref: drop the reference after in-flight submissions complete, residency
+// set untouched — samplers never enter it, see res_add call sites), and rebuilt at the new level on next use.
+void dm_aniso_apply_now(void) {
+    pthread_mutex_lock(&g_rmu);
+    for (int i = 0; i < g_nsreg; i++) if (g_sview[i]) { defer_obj_unref((__bridge id)g_sview[i]); g_sview[i] = NULL; g_srid[i] = 0; }
+    g_reg_gen++;
+    pthread_mutex_unlock(&g_rmu);
+}
+
+// MetalFX Spatial 超分（launcher-metalfx-spatial）：只在 Metal 4 出图路径接管。
+// 运行时查类、不链接 MetalFX.framework（模板工程是否链接它未知）：
+// 描述器与 scaler 的方法只以前向 @protocol 声明 + NSClassFromString 调用；
+// scaler 创建要一个 MTL4Compiler，取法是 [device newCompilerWithDescriptor:error:]（头文件绑定核实）。
+// 颜色处理固定 Perceptual（sRGB 内容，绑定核实值 0，也是描述器默认值）。
+// MetalFX Spatial upscaling (launcher-metalfx-spatial): only on the Metal 4 present path.
+// Runtime class lookup, no link-time dependency on MetalFX.framework (unknown whether the
+// template project links it): descriptor/scaler methods are declared only as forward @protocols
+// and invoked via NSClassFromString; the scaler needs an MTL4Compiler from
+// [device newCompilerWithDescriptor:error:] (verified from header bindings).
+// Color processing is fixed to Perceptual (sRGB content, verified value 0, also the descriptor default).
+// 超分总开关（与 DM_ANISO 同款惰性环境变量模式）：-2 未初始化；DM_MTLFX_SPATIAL=1/on → 1，否则 0。
+// 注意：开关函数必须放在 #if !DM_NVN_M3 外面——18.0 变体（DM_NVN_M3=1）不编译 scaler，
+// 但 LauncherVC.m 的菜单开关仍链接 dm_mtlfx_set/get；放里面会导致 18.0 链接失败。
+// Master MetalFX switch (same lazy-env pattern as DM_ANISO): -2 uninitialized; DM_MTLFX_SPATIAL=1/on -> 1, else 0.
+// NOTE: these must live outside the #if !DM_NVN_M3 guard — the 18.0 variant (DM_NVN_M3=1)
+// skips the scaler, but LauncherVC.m still links dm_mtlfx_set/get; keeping them inside breaks the 18.0 link.
+static _Atomic int g_dm_mtlfx = -2;
+static int dm_mtlfx_mode(void) {
+#if DM_NVN_M3
+    return 0;   // Metal 3 路径没有 scaler，开关恒关（菜单开关在 18.0 变体上会弹回关，不假装能开）
+#else
+    int v = atomic_load(&g_dm_mtlfx);
+    if (v != -2) return v;
+    const char *e = getenv("DM_MTLFX_SPATIAL");
+    int m = (e && (e[0] == '1' || (e[0] == 'o' && e[1] == 'n'))) ? 1 : 0;
+    atomic_store(&g_dm_mtlfx, m); return m;
+#endif
+}
+void dm_mtlfx_set(int v) { atomic_store(&g_dm_mtlfx, v ? 1 : 0); }
+int dm_mtlfx_get(void) { return dm_mtlfx_mode(); }
+#if !DM_NVN_M3
+@protocol DmMTLFXSpatialScalerDescriptor <NSObject>
+@property (nonatomic) NSUInteger inputWidth;
+@property (nonatomic) NSUInteger inputHeight;
+@property (nonatomic) MTLPixelFormat colorTextureFormat;
+@property (nonatomic) NSInteger colorProcessingMode;
+@property (nonatomic) NSUInteger outputWidth;
+@property (nonatomic) NSUInteger outputHeight;
+@property (nonatomic) MTLPixelFormat outputTextureFormat;
++ (BOOL)supportsMetal4FX:(id<MTLDevice>)device;
+- (id)newSpatialScalerWithDevice:(id<MTLDevice>)device compiler:(id)compiler;
+@end
+@protocol DmMTLFXSpatialScaler <NSObject>
+@property (nonatomic, strong) id<MTLTexture> colorTexture;
+@property (nonatomic, strong) id<MTLTexture> outputTexture;
+@property (nonatomic) NSUInteger inputContentWidth;
+@property (nonatomic) NSUInteger inputContentHeight;
+@property (nonatomic, readonly) MTLTextureUsage colorTextureUsage;
+@property (nonatomic, readonly) MTLTextureUsage outputTextureUsage;
+- (void)encodeToCommandBuffer:(id<MTL4CommandBuffer>)commandBuffer;
+@end
+@protocol DmMTLDeviceMTL4 <NSObject>
+- (id)newCompilerWithDescriptor:(id)descriptor error:(NSError **)error;
+@end
+
+static pthread_mutex_t g_mfx_mu = PTHREAD_MUTEX_INITIALIZER;   // present 线程与回落线程都可能进 scaler，持锁串行
+static id<DmMTLFXSpatialScaler> g_mfx_scaler;                  // 当前尺寸的 scaler（尺寸变了重建）
+static id g_mfx_compiler;
+static id<MTLTexture> g_mfx_out[3];                            // 3 张中间纹理，与 3 个 present 槽位一一对应
+static NSUInteger g_mfx_iw, g_mfx_ih, g_mfx_ow, g_mfx_oh;
+static MTLPixelFormat g_mfx_ifmt, g_mfx_ofmt;
+static int g_mfx_state;                                        // 0 未试，1 可用，-1 永久不可用（失败只记一次）
+// 确保 scaler 可用（调用方持 g_mfx_mu）：尺寸不变直接返回 0；尺寸变了重建 scaler；失败记 -1 不再重试。
+static int mfx_ensure(NSUInteger iw, NSUInteger ih, MTLPixelFormat ifmt, NSUInteger ow, NSUInteger oh, MTLPixelFormat ofmt) {
+    if (g_mfx_state < 0) return -1;
+    if (g_mfx_state == 1 && iw == g_mfx_iw && ih == g_mfx_ih && ifmt == g_mfx_ifmt && ow == g_mfx_ow && oh == g_mfx_oh && ofmt == g_mfx_ofmt) return 0;
+    // 本 App 没有链接 MetalFX.framework（Makefile 只链 Metal）：不先 dlopen 的话，
+    // NSClassFromString 永远找不到这个类——这就是 13.1 上 scaler 没接上的原因。
+    // This app does not link MetalFX.framework (the Makefile links only Metal), so
+    // without dlopen first, NSClassFromString can never find this class — that is
+    // why the scaler never engaged on 13.1.
+    static void *mfx_handle;
+    if (!mfx_handle) mfx_handle = dlopen("/System/Library/Frameworks/MetalFX.framework/MetalFX", RTLD_NOW | RTLD_LOCAL);
+    Class<DmMTLFXSpatialScalerDescriptor> descCls = (Class<DmMTLFXSpatialScalerDescriptor>)NSClassFromString(@"MTLFXSpatialScalerDescriptor");
+    if (!descCls) {
+        MLOG("超分：找不到 MTLFXSpatialScalerDescriptor 类（MetalFX.framework 未加载），保持线性放大");
+        g_mfx_state = -1; return -1;
+    }
+    if (![descCls supportsMetal4FX:g_dev]) {
+        MLOG("超分：本机不支持 MetalFX Spatial（supportsMetal4FX=NO），保持线性放大");
+        g_mfx_state = -1; return -1;
+    }
+    Class cdCls = NSClassFromString(@"MTL4CompilerDescriptor");
+    if (!cdCls) { MLOG("超分：无 MTL4CompilerDescriptor 类，保持线性放大"); g_mfx_state = -1; return -1; }
+    NSError *ce = nil;
+    id compiler = [(id<DmMTLDeviceMTL4>)g_dev newCompilerWithDescriptor:[cdCls new] error:&ce];
+    if (!compiler) { MLOG("超分：MTL4Compiler 创建失败（%@），保持线性放大", ce); g_mfx_state = -1; return -1; }
+    // Class<Protocol> 上调 +new 编不过（协议没声明它）：先转回普通 Class 再 new。
+    id<DmMTLFXSpatialScalerDescriptor> desc = [(Class)descCls new];
+    desc.inputWidth = iw; desc.inputHeight = ih; desc.colorTextureFormat = ifmt;
+    desc.colorProcessingMode = 0;   // Perceptual（sRGB）
+    desc.outputWidth = ow; desc.outputHeight = oh; desc.outputTextureFormat = ofmt;
+    id<DmMTLFXSpatialScaler> sc = [desc newSpatialScalerWithDevice:g_dev compiler:compiler];
+    if (!sc) { MLOG("超分：scaler 创建失败（%lux%lu fmt%lu → %lux%lu fmt%lu），保持线性放大", (unsigned long)iw, (unsigned long)ih, (unsigned long)ifmt, (unsigned long)ow, (unsigned long)oh, (unsigned long)ofmt); g_mfx_state = -1; return -1; }
+    g_mfx_scaler = sc; g_mfx_compiler = compiler;
+    g_mfx_iw = iw; g_mfx_ih = ih; g_mfx_ifmt = ifmt; g_mfx_ow = ow; g_mfx_oh = oh; g_mfx_ofmt = ofmt; g_mfx_state = 1;
+    MLOG("超分：scaler 就绪 %lux%lu fmt%lu → %lux%lu fmt%lu（输入需 usage %lu，输出需 usage %lu）", (unsigned long)iw, (unsigned long)ih, (unsigned long)ifmt, (unsigned long)ow, (unsigned long)oh, (unsigned long)ofmt, (unsigned long)sc.colorTextureUsage, (unsigned long)sc.outputTextureUsage);
+    return 0;
+}
+// 取第 i 槽的中间纹理（调用方持 g_mfx_mu）：尺寸/格式变了重建；输出纹理必须是 Private 存储（scaler 文档要求），并登记驻留。
+static id<MTLTexture> mfx_out_for(int i, NSUInteger w, NSUInteger h, MTLPixelFormat fmt) {
+    id<MTLTexture> t = g_mfx_out[i];
+    if (t && t.width == w && t.height == h && t.pixelFormat == fmt) return t;
+    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:fmt width:w height:h mipmapped:NO];
+    d.usage = MTLTextureUsageShaderWrite | MTLTextureUsageShaderRead;
+    d.storageMode = MTLStorageModePrivate;
+    t = [g_dev newTextureWithDescriptor:d];
+    if (!t) { MLOG("超分：中间纹理创建失败 %lux%lu fmt%lu", (unsigned long)w, (unsigned long)h, (unsigned long)fmt); return nil; }
+    res_add(t);
+    g_mfx_out[i] = t;
+    return t;
+}
+#endif
 static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Caller holds g_rmu
     if (sid < 0 || sid >= g_nsreg || !g_sreg_ok[sid]) { RED_ONCE(12, "采样器号 %d 未登记", sid); return nil; }
     if (g_sview[sid]) return (__bridge id<MTLSamplerState>)g_sview[sid];
@@ -2558,7 +2700,7 @@ static id<MTLSamplerState> samp_by_id(int sid) {   // 调用方持 g_rmu | Calle
     d.mipFilter = p.minf <= 1 ? MTLSamplerMipFilterNotMipmapped : (p.minf == 2 || p.minf == 3) ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
     d.sAddressMode = wrapm(p.ws); d.tAddressMode = wrapm(p.wt); d.rAddressMode = wrapm(p.wr);
     d.lodMinClamp = p.lod_min < 0 ? 0 : p.lod_min; d.lodMaxClamp = p.lod_max;
-    d.maxAnisotropy = p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso;
+    { int am = dm_aniso_mode(); d.maxAnisotropy = am >= 1 ? (NSUInteger)am : (p.aniso < 1 ? 1 : p.aniso > 16 ? 16 : (NSUInteger)p.aniso); }
     if (p.cmp_mode) d.compareFunction = (MTLCompareFunction)(p.cmp_func - 1);
     d.borderColor = p.border[3] > 0.5f ? (p.border[0] > 0.5f ? MTLSamplerBorderColorOpaqueWhite : MTLSamplerBorderColorOpaqueBlack) : MTLSamplerBorderColorTransparentBlack;
     d.supportArgumentBuffers = YES;
@@ -4570,8 +4712,12 @@ static int fz_p2_draw(NvProg *pr, const p_draw *dw, const p_draw_idx *di, uint8_
     g_fz_draws++; return 1;
 }
 static void bloomq_reset(void) { memset(&g_bloomq, 0, sizeof g_bloomq); }
+int dm_vfx_level(void);   // 特效档位（宿主 dm_custom.c 强定义，见本文件 dm_fps_setting 旁的弱定义）：0 低 / 1 中 / 2 高，每帧现读、改档下一帧生效
 static int bloomq_enabled(void) {
     if (g_bloom_q < 0) { const char *e = getenv("DM_NVN_BLOOM_Q"); g_bloom_q = !e || strcmp(e, "0"); }
+    int v = dm_vfx_level();   // 低档强制泛光降质、高档强制全质量（盖过 env / 真机交替量 g_bloom_q）；中档照旧返回 g_bloom_q（env 与 ub_var 交替都不受影响）
+    if (v == 0) return 1;
+    if (v >= 2) return 0;
     return g_bloom_q;
 }
 static int bloomq_target(uint64_t *ser, int *lv, int *sl) {
@@ -4729,7 +4875,8 @@ static void draw(const p_draw *dw, const p_draw_idx *di) {
         if (k >= 0) { uint64_t s_; int lv, sl; rt_sub(&R.rt, k, &s_, &lv, &sl); const tex_t *t = k == 8 ? R.rt.depth : R.rt.color[0]; if ((int)MAX(t->d.width >> lv, 1u) <= small) return; } } }
     // 试验开关 DM_NVN_NOFXAA=1（缺省关，去留按视觉尺子 + 实机看图定）：跳过 FXAA 那次全屏绘制，后面的锐化 / 放大改读 FXAA 的输入（色调映射结果）
     // Experimental switch DM_NVN_NOFXAA=1 (off by default; keep or drop decided by the visual ruler + looking at the picture on a real machine): skips the FXAA full-screen draw, and the later sharpening / upscale reads FXAA's input instead (the tone mapping result)
-    { static int nofxaa = -1; static uint64_t fx_from, fx_to; if (nofxaa < 0) { const char *e = getenv("DM_NVN_NOFXAA"); nofxaa = e && !strcmp(e, "1"); if (nofxaa) MLOG("DM_NVN_NOFXAA=1：跳过 FXAA"); }
+    { static int nofxaa_env = -1; static uint64_t fx_from, fx_to; if (nofxaa_env < 0) { const char *e = getenv("DM_NVN_NOFXAA"); nofxaa_env = e && !strcmp(e, "1"); if (nofxaa_env) MLOG("DM_NVN_NOFXAA=1：跳过 FXAA"); }
+      int nofxaa = nofxaa_env || dm_vfx_level() == 0;   // 特效低档（vfx=0）运行时关 FXAA：每帧现算，自定义页改档下一帧就跳过（中 / 高档不干预，仍按 env）
       if (nofxaa && tbdr_on() && !g_defer_replaying && pr->sh[1]) { NvShader *f = pr->sh[1];
         if (!strncmp(f->key, "ebcfcd1fa0a77dbc", 16) && !g_enc && R.rt.n == 1 && R.rt.color[0] && !R.clear_c[0]) {
             uint64_t h = 0; for (int i = 0; i < f->rf.nb && !h; i++) if (f->rf.b[i].kind == NVN_RB_TEX && f->rf.b[i].reg < 128) h = S.tex[1][f->rf.b[i].reg];
@@ -5444,8 +5591,34 @@ void mtl_host_apply(uint64_t v) { int frz = (int)(uint32_t)v - 1, force = (int)(
 // Game logic already runs at 25 ticks / second and unit positions are interpolated by time, so there are no repeated frames at 30 frames (measured on a real device: coefficient of variation of per-frame camera displacement 0.292 at 30 frames, 0.296 at 60 frames).
 // The switch is on the 「自定义」(Custom) page (dm_custom.c eco_fps, off by default, takes effect on apply); the test switch DM_FPS=30/60 pins it.
 __attribute__((weak)) int dm_fps_setting(void) { return 60; }   // 宿主 dm_custom.c 提供强定义；图形单测不链宿主时恒 60 | The host's dm_custom.c provides the strong definition; always 60 when graphics unit tests do not link the host
-int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; else MLOG("DM_FPS=%d：帧数由测试开关钉住", env); }
-    return env > 0 ? env : dm_fps_setting() == 30 ? 30 : 60; }
+__attribute__((weak)) int dm_vfx_level(void) { return 1; }   // 特效档位（0 低 / 1 中 / 2 高）：宿主 dm_custom.c 提供强定义；图形单测不链宿主时恒中档 | Effects tier (0 low / 1 medium / 2 high): the host's dm_custom.c provides the strong definition; always medium when graphics unit tests do not link the host
+// 游戏内菜单的帧率锁定（launcher-spatial-menu）：0 = 未设（跟随自定义页 eco_fps），30 / 40 / 50 / 55 / 60 = 菜单锁定。
+// 40 = 稳帧档：120 Hz 屏的整数分频（平均每 3 次刷新出一帧、25 ms），节拍由出图节拍模式 3 的软节拍放行（见 link_sync 与 g_pace_due）。
+// 50 / 55 = 非整除试档：120 Hz 屏上理想帧间隔 20.0 / 18.18 ms 不是刷新周期（8.33 ms）的整数倍，放行门按理想周期累加
+// 应出图时刻（见出图回调里的 g_pace_due 累加支），上屏间隔在 2 / 3 个刷新之间按比例交替（50 约 3 短 2 长 / 5 帧、
+// 55 约 9 短 2 长 / 11 帧），平均帧率精确；整除档仍走原样（实际出图 + 整除档周期顺延）。
+// 优先级：菜单锁定 > DM_FPS 环境变量钉住（启动器选 60 时在 Play 前 setenv，是启动器的缺省档）> 自定义页。
+// 本函数是帧率目标的唯一汇聚点：节拍基线（link_sync）、前端帧率提示（DmRateHint）、3D 比例控制器的目标周期都只读它，
+// 所以菜单一旦锁定，DM_FPS 不再影响任何基线；菜单未锁定时 DM_FPS 才兜底。菜单锁定时自定义页的改动暂时不起作用，
+// 直到菜单选回“跟随游戏内设置”。
+// 40 = steady-frame tier: an integer divisor of a 120 Hz screen (one frame per 3 refreshes on average, 25 ms), admitted by the soft pacing of display-link mode 3 (see link_sync and g_pace_due).
+// 50 / 55 = non-divisor trial tiers: on a 120 Hz screen the ideal frame intervals 20.0 / 18.18 ms are not whole multiples
+// of the refresh period (8.33 ms), so the gate accumulates the due time by the ideal period (see the accumulating branch
+// for g_pace_due in the display-link callback) and present intervals alternate between 2 and 3 refreshes in proportion
+// (50: about 3 short + 2 long per 5 frames; 55: about 9 short + 2 long per 11), making the average rate exact; divisor
+// tiers keep the original form (actual present + divisor-tier period, re-anchored).
+// Precedence: menu lock > DM_FPS env pin (set by the launcher before Play when it selects 60, its default tier) > Custom page.
+// This function is the single funnel for the frame-rate target: the pacing baseline (link_sync), the front-end frame rate hint (DmRateHint)
+// and the 3D scale controller's target period all read only it, so once the menu lock is set DM_FPS no longer affects any baseline;
+// DM_FPS is only the fallback while the menu is unlocked. While the menu lock is set, Custom-page
+// changes have no effect until the menu is set back to "follow".
+static _Atomic int g_dm_menu_fps;
+void dm_menu_fps_set(int v) { atomic_store(&g_dm_menu_fps, (v == 30 || v == 40 || v == 50 || v == 55 || v == 60) ? v : 0); }
+int dm_menu_fps_get(void) { return atomic_load(&g_dm_menu_fps); }
+int mtl_fps_target(void) { static int env = -2; if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 40 && env != 50 && env != 55 && env != 60) env = -1; else MLOG("DM_FPS=%d：帧数由测试开关钉住", env); }
+    int m = atomic_load(&g_dm_menu_fps); if (m == 30 || m == 40 || m == 50 || m == 55 || m == 60) return m;
+    if (env > 0) return env;
+    return dm_fps_setting() == 30 ? 30 : 60; }
 // 外推启用状态一变（省电模式切换、世界冻结接手 / 交回）：先让「跨帧不写回」账本重学（试用期里照常写回），外推晚一帧再真正切换——
 // 保证切换前最后一次提交是全量写回的。不然 30 帧时每帧先清空的附件被学成不写回，切回 60 帧的第一个外推帧读到旧内容、闪一帧（测试版实测，xv 自检报红后才撤销）
 // Whenever the extrapolation enabled state changes (power-saving mode toggled, world freeze takes over / hands back): first let the "no store across frames" ledger relearn (during the trial period it stores as usual), and the extrapolation really switches one frame later --
@@ -6004,7 +6177,7 @@ int mtl_display_hz(void) { return (int)(mtl_display_refresh() + 0.5); }
 // 原先固定 60：144 Hz 屏上 60 不整除，系统只能 2 拍 / 3 拍交替（13.9 / 20.8 ms），看着一顿一顿。算式见 nvn_pace.h nvn_pace_hz
 // Previously fixed at 60: 60 does not evenly divide a 144 Hz screen, so the system can only alternate 2 / 3 refreshes (13.9 / 20.8 ms), which looks stuttery. Formula in nvn_pace.h nvn_pace_hz
 double dm_pace_hz(double screen_hz, double floor_hz) { return nvn_pace_hz(screen_hz, floor_hz); }
-double mtl_pace_hz(void) { return dm_pace_hz(mtl_display_refresh(), mtl_fps_target() == 30 ? 30 : 60); }
+double mtl_pace_hz(void) { return dm_pace_hz(mtl_display_refresh(), mtl_fps_target()); }   // 按实际目标取整除档：60 / 40 / 30 在 120 Hz 屏上分别是每 2 / 3 / 4 次刷新一帧 | Take the evenly dividing tier for the actual target: 60 / 40 / 30 on a 120 Hz screen are one frame per 2 / 3 / 4 refreshes
 static _Atomic uint64_t g_present_stall_ns;   // 单测用：出图线程每次出图前额外停顿（模拟 drawable 迟迟不可用） | For unit tests: an extra pause before each present on the present thread (simulating a drawable that stays unavailable)
 #if !DM_NVN_M3
 static CAMetalLayer *g_present_layer_resident;
@@ -6105,6 +6278,30 @@ static int present_encode_m4(CBUF cb, id<MTLTexture> src0, id<MTLTexture> dst, c
         cx = crop[0]; cy = crop[1]; cw = crop[2]; ch = crop[3];
     }
     present_pipeline(dst.pixelFormat);
+#if !DM_NVN_M3
+    // MetalFX Spatial（launcher-metalfx-spatial）：只在整帧、无裁切、且源与目标尺寸不同时接管：
+    // scaler 把源放大到目标尺寸的中间纹理，再走下面原有的 blit（视口会重算为铺满）。
+    // 1:1 时直接走线性 blit，不付 scaler 成本；源纹理 usage 不满足 scaler 要求时也直通（只记一次）。
+    if (dm_mtlfx_mode() == 1 && cx == 0 && cy == 0 && cw == src.width && ch == src.height &&
+        (src.width != dst.width || src.height != dst.height)) {
+        pthread_mutex_lock(&g_mfx_mu);
+        if (mfx_ensure(src.width, src.height, src.pixelFormat, dst.width, dst.height, dst.pixelFormat) == 0) {
+            id<MTLTexture> mfxOut = mfx_out_for(uv_i, dst.width, dst.height, dst.pixelFormat);
+            if (mfxOut && (src.usage & g_mfx_scaler.colorTextureUsage) == g_mfx_scaler.colorTextureUsage) {
+                g_mfx_scaler.colorTexture = src;
+                g_mfx_scaler.inputContentWidth = cw;
+                g_mfx_scaler.inputContentHeight = ch;
+                g_mfx_scaler.outputTexture = mfxOut;
+                [g_mfx_scaler encodeToCommandBuffer:cb];
+                src = mfxOut; cx = 0; cy = 0; cw = src.width; ch = src.height;
+            } else if (mfxOut) {
+                static int mfxUsageLogged;
+                if (!mfxUsageLogged) { mfxUsageLogged = 1; MLOG("超分：源纹理 usage %lu 不满足 scaler 要求 %lu，保持线性放大", (unsigned long)src.usage, (unsigned long)g_mfx_scaler.colorTextureUsage); }
+            }
+        }
+        pthread_mutex_unlock(&g_mfx_mu);
+    }
+#endif
     double dw = dst.width, dh = dst.height, s = fmin(dw / cw, dh / ch);
     MTLViewport vp = {floor((dw - cw * s) / 2), floor((dh - ch * s) / 2), round(cw * s), round(ch * s), 0, 1};
     if (fabs((dw / dh) / ((double)cw / ch) - 1) < 0.01) vp = (MTLViewport){0, 0, dw, dh, 0, 1};
@@ -6329,6 +6526,16 @@ static pq_item g_pq[PQ];
 static uint64_t g_pq_in;
 static int present_now(const tex_t *, double, uint64_t, uint64_t, const int[4], id<CAMetalDrawable>, double);
 
+// 软节拍（模式 3，30 / 40 / 50 / 55 锁定档）：显示节拍保持屏幕全速刷新，节拍回调按目标间隔放行——未到应出图时刻的拍不取帧；
+// 迟到的帧在下一个刷新拍立即上屏，应出图时刻按这次实际出图顺延重排（迟到只付一个刷新周期，不再等整槽 25 / 33.3 ms）。
+// g_pace_soft 由 link_sync 在模式对齐时写（模式 3 = 1）；g_pace_due / g_pace_tgt 只在节拍线程读写。
+// Soft pacing (mode 3, 30 / 40 / 50 / 55 locks): the display link keeps running at full screen refresh and the callback admits frames
+// by target interval -- a tick before the next due time does not take a frame; a late frame is presented at the very next
+// refresh tick and the due time is re-anchored to that actual present (a late frame costs one refresh period, not a whole
+// 25 / 33.3 ms slot). g_pace_soft is written by link_sync when aligning the mode (mode 3 = 1); g_pace_due / g_pace_tgt
+// are read and written only on the display link thread.
+static int g_pace_soft; static double g_pace_due; static int g_pace_tgt;
+
 @interface NvMetalDisplayLinkDelegate : NSObject <CAMetalDisplayLinkDelegate>
 @end
 
@@ -6369,6 +6576,11 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
     pthread_mutex_unlock(&g_link_mu);
     pthread_mutex_lock(&g_pq_mu);
     if (!g_dm_present_link || g_pq_read == g_pq_in) { pthread_mutex_unlock(&g_pq_mu); return; }
+    if (g_pace_soft) {   // 软节拍放行：这一拍的目标上屏时刻还没到应出图时刻就不取帧（帧留在队列里、游戏侧按票号等它，不算丢帧）；到了 / 过了就立即取最新一帧，迟到只等这一个刷新拍 | Soft-pacing admission: if this tick's target presentation time has not reached the due time, do not take a frame (it stays queued and the game waits for it by ticket, not a drop); once due or past, take the latest frame at once -- a late frame waits only this one refresh tick
+        int tgt = mtl_fps_target();
+        if (tgt != g_pace_tgt) { g_pace_tgt = tgt; g_pace_due = 0; }   // 目标换了：旧相位作废，下一帧立即出图重新起拍 | Target changed: discard the old phase, the next frame presents immediately and re-anchors
+        if (g_pace_due > 0 && update.targetPresentationTimestamp < g_pace_due - 0.0005) { pthread_mutex_unlock(&g_pq_mu); return; }
+    }
     uint64_t first = g_pq_read + 1, ticket = g_pq_in;
     pq_item it = g_pq[(g_pq_in - 1) % PQ]; g_link_it_tin = it.t_in;
     g_pq_read = g_pq_in;
@@ -6384,16 +6596,24 @@ __attribute__((weak)) uint64_t dm_focus_in_since(void) { return 0; }
         pthread_cond_broadcast(&g_pq_cv);
         pthread_mutex_unlock(&g_pq_mu);
     }
+    else if (g_pace_soft) { int tgt = g_pace_tgt;
+        if (tgt == 50 || tgt == 55) {   // 非整除档：应出图时刻按理想周期（1 / 目标）从上一个应出图时刻累加——不能从被刷新粒度取整的实际出图时刻起算，否则每帧的零头都被进位成整刷新、间隔一律变 3 个刷新（50 档会实际跑成 40）；累加下间隔在 2 / 3 个刷新间按比例交替、平均精确。迟到满一个周期以上（产帧卡顿）不攒相位差：重新以这次实际出图起拍 | Non-divisor tiers: the due time accumulates the ideal period (1 / target) from the previous due time -- anchoring to the refresh-quantized actual present instead would round every frame's fraction up to a whole refresh and make every interval 3 refreshes (a 50 lock would actually run at 40); accumulated, the intervals alternate between 2 and 3 refreshes in proportion and the average is exact. A stall of a full period or more accumulates no phase debt: the cadence re-anchors to this actual present
+            double per = 1.0 / tgt, nd = g_pace_due + per;
+            if (g_pace_due <= 0 || nd <= update.targetPresentationTimestamp) nd = update.targetPresentationTimestamp + per;
+            g_pace_due = nd;
+        }
+        else { double per = mtl_pace_hz(); if (per > 0) g_pace_due = update.targetPresentationTimestamp + 1.0 / per; } }   // 整除档（30 / 40）：应出图时刻 = 这次实际出图 + 目标周期：迟到不攒相位差，之后的节拍跟着顺延（平均仍是目标帧率） | Divisor tiers (30 / 40): due time = this actual present + target period: lateness is not accumulated as phase debt, following slots shift along (the average is still the target rate)
 }
 @end
 
 static CAMetalDisplayLink *g_link; static CFRunLoopRef g_link_rl; static int g_link_started;
 static int g_link_owns_layer, g_classic_busy;   // 持 g_pq_mu：图层挂着节拍对象期间 nextDrawable 会抛异常，自取 drawable 的出图线程与节拍对象互斥 | Under g_pq_mu: nextDrawable throws while the layer has the display link object attached, so the present thread that takes its own drawable and the display link object are mutually exclusive
 static int link_on(void) { return g_dm_present_link && g_link != nil; }
-static CAFrameRateRange link_range(int mode) {   // 1 / 3 按屏幕刷新率选整除的那一档（mtl_pace_hz）；2（120 Hz 节拍、测试档）不变 | 1 / 3 pick the evenly dividing tier by screen refresh rate (mtl_pace_hz); 2 (120 Hz pacing, test tier) unchanged
+static CAFrameRateRange link_range(int mode) {   // 1 按目标整除档（mtl_pace_hz）；2（120 Hz 节拍、测试档）不变；3 = 软节拍：节拍保持屏幕全速刷新，放行间隔由节拍回调按目标判（见 g_pace_due） | 1 takes the evenly dividing tier of the target (mtl_pace_hz); 2 (120 Hz pacing, test tier) unchanged; 3 = soft pacing: the link stays at full screen refresh and the callback admits frames by target interval (see g_pace_due)
     if (mode == 2) return CAFrameRateRangeMake(60, 120, 120);
+    if (mode == 3) { float rf = (float)mtl_display_refresh(); if (rf <= 0) rf = 120; return CAFrameRateRangeMake(rf, rf, rf); }
     float r = (float)mtl_pace_hz(); return CAFrameRateRangeMake(r, r, r); }
-static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 省电模式 30 Hz | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = power-saving mode 30 Hz
+static int g_link_mode = 1;   // 节拍对象当前的模式：1 / 2 同 g_dm_present_link，3 = 低于 60 的锁定档软节拍（30 省电 / 40 稳帧：节拍保持全速刷新，回调按 mtl_pace_hz 的目标间隔放行） | Current mode of the display link object: 1 / 2 same as g_dm_present_link, 3 = sub-60 lock soft pacing (30 power saving / 40 steady: the link stays at full refresh, the callback admits by the mtl_pace_hz target interval)
 static void *link_main(void *arg) {   // 显示节拍线程：切到节拍模式时起，切回 0 时退出 | Display link thread: started when switching to display-link mode, exits when switching back to 0
     (void)arg;
     pthread_setname_np("nvn-present-link");
@@ -6418,7 +6638,7 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
         MLOG("显示节拍：抢救期满，换回节拍模式 %d 再试（帧 %llu）", g_dm_present_link, (unsigned long long)atomic_load(&g_cur_frame)); }
     int want = g_dm_present_link;
     if (want < 0 || want > 2) { g_dm_present_link = applied == 3 ? 1 : applied; return; }
-    if (want && mtl_fps_target() == 30) want = 3;   // 省电模式：显示节拍 30 Hz（按屏幕刷新率取整除档） | Power saving mode: display pacing 30 Hz (evenly dividing tier by screen refresh rate)
+    if (want && mtl_fps_target() != 60) want = 3;   // 低于 60 的锁定档（30 省电 / 40 稳帧 / 50 / 55 非整除试档）：软节拍——显示节拍保持屏幕全速刷新，回调按目标间隔放行（120 Hz 屏平均：30 = 每 4 次刷新、40 = 每 3 次刷新出一帧；迟到的帧只等下一个刷新拍，不再等整槽） | Sub-60 locks (30 power saving / 40 steady): soft pacing -- the display link stays at full screen refresh and the callback admits frames by target interval (on a 120 Hz screen on average: 30 = one frame per 4 refreshes, 40 = one per 3; a late frame waits only for the next refresh tick, not a whole slot)
     if (want == applied && want && want != 2 && g_link) {   // 窗口换了屏 / 屏幕改了刷新率：节拍跟着换到新的整除档 | Window moved to another screen / screen refresh rate changed: pacing switches to the new evenly dividing tier
         double hz = mtl_pace_hz();
         if (hz != applied_hz) { CAMetalDisplayLink *link = g_link; link.preferredFrameRateRange = link_range(want);
@@ -6427,7 +6647,7 @@ static void link_sync(void) {   // 游戏出图线程每帧调：把节拍对象
         return;
     }
     if (want == applied) return;
-    g_link_mode = want;
+    g_link_mode = want; g_pace_soft = (want == 3);   // 软节拍开关随模式走（节拍线程读） | The soft-pacing switch follows the mode (read on the display link thread)
     if (!g_link_started) {
         if (!want) { applied = 0; return; }
         if (!front_metal_layer()) return;
@@ -6572,7 +6792,9 @@ int mtl_link_wait_tick(uint64_t timeout_ns) {
     // Wait for the display link only when running faster than the display: if a display-link tick has already passed since the previous frame started work (this frame is already behind), start immediately instead of waiting in vain for the next display-link tick --
     // otherwise when the frame time is slightly more than one display-link period it would "miss the tick -> wait another whole tick", locking the frame rate straight to half (measured on Mac under windowed load: runs of dropped frames)
     static uint64_t started_tick;   // 上一帧开工时的节拍号（只有游戏出图线程调本函数） | Display-link tick number when the previous frame started work (only the game's present thread calls this function)
-    const uint64_t step = g_dm_present_link == 2 ? 2 : 1;   // 一帧占几拍：60 Hz 节拍 1 拍；120 Hz 节拍 2 拍（游戏仍按 60 帧出） | How many display-link ticks one frame takes: 1 with a 60 Hz display link; 2 with a 120 Hz display link (the game still outputs 60 frames)
+    uint64_t step = g_dm_present_link == 2 ? 2 : 1;   // 一帧占几拍：60 Hz 节拍 1 拍；120 Hz 节拍 2 拍（游戏仍按 60 帧出） | How many display-link ticks one frame takes: 1 with a 60 Hz display link; 2 with a 120 Hz display link (the game still outputs 60 frames)
+    if (step == 1 && g_pace_soft) { int tgt = mtl_fps_target(); double per = (tgt == 50 || tgt == 55) ? (double)tgt : mtl_pace_hz(), rf = mtl_display_refresh();   // 软节拍：节拍本身是全速刷新，一帧占 刷新率 / 目标档 个拍（120 Hz 屏锁 40 = 3 拍、锁 30 = 4 拍），游戏的生产节奏仍按目标走，不会按 120 Hz 空转产帧再被合并丢弃；50 / 55 非整除：步长按真实目标算（120 Hz 屏 = 2 拍，比理想的 2.4 / 2.18 拍略快，多的由放行门合并裁掉；取 3 拍生产反而跟不上目标、节拍饿死） | Soft pacing: the ticks run at full refresh, so one frame spans refresh / target ticks (120 Hz screen: 3 ticks at a 40 lock, 4 at a 30 lock); game production still follows the target instead of spinning at 120 Hz and being merged away; 50 / 55 are non-divisor: the step is computed from the real target (2 ticks on a 120 Hz screen, slightly faster than the ideal 2.4 / 2.18 ticks, the excess merged away by the gate; 3 ticks would produce below target and starve the pacing)
+        if (per > 0 && rf > 0) { step = (uint64_t)(rf / per + 0.5); if (!step) step = 1; } }
     pthread_mutex_lock(&g_link_mu);
     if (g_link_tick_n >= started_tick + step) { started_tick = g_link_tick_n; pthread_mutex_unlock(&g_link_mu); return 1; }
     struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts);

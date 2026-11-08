@@ -913,7 +913,7 @@ static void touch_ui_message(const char *cat,const char *act,const char *arg) {
 @implementation DmRateHint
 - (void)tick:(CADisplayLink *)l {
     extern int mtl_fps_target(void);
-    { static int last = -1; int f = mtl_fps_target(); if (f != last) { last = f; l.preferredFrameRateRange = f == 30 ? CAFrameRateRangeMake(30, 30, 30) : CAFrameRateRangeMake(60, 60, 60); } }   // 省电模式（30 帧）：帧率提示一起降，ProMotion 屏才会真降刷新率 | Power-saving mode (30 fps): lower the frame rate hint as well; only a ProMotion screen actually lowers the refresh rate
+    { static int last = -1; int f = mtl_fps_target(); if (f != last) { last = f; if (f == 30 || f == 40 || f == 50 || f == 55) { float mx = (float)UIScreen.mainScreen.maximumFramesPerSecond; if (mx < 60) mx = 60; l.preferredFrameRateRange = CAFrameRateRangeMake(60, mx, mx); } else l.preferredFrameRateRange = CAFrameRateRangeMake(60, 60, 60); } }   // 30 / 40 / 50 / 55 锁定档走软节拍（nvn_mtl 模式 3）：面板保持全速刷新，显示节拍回调才有刷新粒度（120 Hz 屏 8.33 ms）放行迟到帧；各档的平均节拍由图形层按目标间隔把关，提示不再把面板钉到目标帧率（旧硬节拍靠钉面板落整除档，帧迟到一个槽就要多等 25 / 33.3 ms；50 / 55 非整除更没有可钉的面板档） | The 30 / 40 / 50 / 55 locks use soft pacing (nvn_mtl mode 3): the panel stays at full refresh so the display link callback can admit late frames at refresh granularity (8.33 ms on a 120 Hz screen); each tier's average cadence is enforced by the graphics layer's target-interval gate, so the hint no longer pins the panel to the target rate (the old hard pacing pinned the panel to the divisor tier, and a frame one slot late waited another 25 / 33.3 ms; 50 / 55 are non-divisor and have no panel tier to pin to at all)
     DmMetalView *v = g_touch_view;
     if (v) {
         if (g_full) { static int lx = -1, ly, lw, lh, lrh, lrw; int x, y, w, h, rw = 0, rh = 0; dm_ui_rect(&x, &y, &w, &h);   // 界面矩形由宿主定（开机后才有、切档会变）：变了就让容器重摆游戏视图 | The UI rectangle is decided by the host (available only after boot, changes when the profile switches): on change, have the container re-lay out the game view
@@ -1002,11 +1002,13 @@ UIView *front_ios_view(CGRect frame) {
     g_layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
     g_layer.contentsScale = UIScreen.mainScreen.nativeScale;
     g_layer.drawableSize = CGSizeMake(frame.size.width * g_layer.contentsScale, frame.size.height * g_layer.contentsScale);
+    { const char *md = getenv("DM_MAX_DRAWABLES"); if (md && atoi(md) == 2) g_layer.maximumDrawableCount = 2; }
     // 真全屏一律套容器：窗口会变尺寸（iPhone Duo 展开 / 折叠），容器的布局回调负责跟着换出图尺寸；启动那一刻窗口碰巧是 16:9 也要套（Mac 上的场景初值 667x375）
     if (g_full || !CGRectEqualToRect(full, frame)) { DmLetterboxView *box = [[DmLetterboxView alloc] initWithFrame:full]; box.backgroundColor = UIColor.blackColor; box.game = v; [box addSubview:v];
         if (g_full) {   // 出图层与游戏视图分离：出图层挂在容器上铺满整窗，游戏视图透明、叠在它上面 | The present layer is separated from the game view: the present layer hangs on the container and fills the whole window; the game view is transparent and stacked on top of it
             CAMetalLayer *ml = [CAMetalLayer layer]; ml.device = g_layer.device; ml.pixelFormat = MTLPixelFormatBGRA8Unorm; ml.contentsScale = g_layer.contentsScale; ml.frame = box.bounds;
-            ml.drawableSize = CGSizeMake(full.size.width * ml.contentsScale, full.size.height * ml.contentsScale); [box.layer insertSublayer:ml atIndex:0];
+            ml.drawableSize = CGSizeMake(full.size.width * ml.contentsScale, full.size.height * ml.contentsScale);
+            { const char *md = getenv("DM_MAX_DRAWABLES"); if (md && atoi(md) == 2) ml.maximumDrawableCount = 2; } [box.layer insertSublayer:ml atIndex:0];
             v.opaque = NO; v.layer.opaque = NO; v.backgroundColor = UIColor.clearColor; g_layer = ml; mtl_set_ui_rect_fn(ui_rect_frac);
             LOG("画面：窗口 %.0fx%.0f 比 16:9 窄 → 真全屏已开：出图层铺满整窗；游戏视图跟宿主的界面矩形走（局内贴底、局外居中），启动先按居中的 %.0fx%.0f 摆", full.size.width, full.size.height, frame.size.width, frame.size.height); return test_fold(box); }
         LOG("画面：窗口 %.0fx%.0f 与游戏画面比例不同 → 游戏视图 %.0fx%.0f 居中（左右各留 %.0f 点、上下各留 %.0f 点）", full.size.width, full.size.height, frame.size.width, frame.size.height, frame.origin.x - full.origin.x, frame.origin.y - full.origin.y); return test_fold(box); }
@@ -1044,6 +1046,16 @@ uint64_t front_game_res(int docked) {
             LOG("画面：比 16:9 窄的手机屏 %ux%u（折叠屏）→ 窗口按 %ux2160 预留，内外屏切换时出图尺寸在这以内跟着窗口变", fw, fh, cw); }
         atomic_store(&g_res_now, (uint64_t)fh << 32 | fw);
     }
+    // MetalFX 超分（launcher-metalfx-spatial）：启动器开超分时，主机模式也按掌机档高度出图
+    // （游戏仍按底座性能档跑），出图时再由 scaler 放大到原生 drawable。
+    // 逐调用判断，不进上面的一次性缓存（启动时缓存已按原生填好）；同时把 g_res_now 也改成
+    // 720 档，让直接读当前出图尺寸的调用方看到同一尺寸。
+    { const char *fx = getenv("DM_MTLFX_SPATIAL");
+      if (fx && (fx[0] == '1' || (fx[0] == 'o' && fx[1] == 'n')) && docked) {
+          uint64_t h = 720, w = (uint64_t)llround(h * aspect / 8) * 8;
+          static int mfxLogged; if (!mfxLogged) { mfxLogged = 1; LOG("超分：主机输出尺寸改 720 档 %lux%lu（scaler 再放大到原生）", (unsigned long)w, (unsigned long)h); }
+          atomic_store(&g_res_now, h << 32 | w);
+          return h << 32 | w; } }
     if (fw && docked) return dm_uiscreen_res_live() ? atomic_load(&g_res_now) : g_res_cap;
     uint64_t h = docked ? 900 : 720, w = (uint64_t)llround(h * aspect / 8) * 8;
     return h << 32 | w;
