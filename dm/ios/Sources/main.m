@@ -6,6 +6,7 @@ static int g_nofile_was, g_nofile_now;   // 启动时的文件描述符软上限
 #import <Metal/Metal.h>
 #import <BackgroundAssets/BackgroundAssets.h>
 #import "asset_dl.h"
+#import "LauncherVC.h"  // 启动器（launcher-v1）：点 Play 前先出启动器，不直接进游戏
 #import <CommonCrypto/CommonDigest.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -715,6 +716,15 @@ static void boot_begin(void) {
 }
 static void *boot_thread(void *arg) {
     (void)arg;
+    // 客体线程（游戏逻辑 + 翻译提交都在它上面跑）：run_boot 创建时只设了栈，没设 QoS，
+    // 默认优先级下系统忙时可能被放在能效核上——重负载时翻译等效频率掉到 1.09GHz 的候选原因。
+    // 出图线程已经是 USER_INTERACTIVE，这里照搬（只改调度优先级，不改渲染逻辑）。
+    // Guest thread (game logic + translation/submission run here): run_boot sets only
+    // the stack, no QoS, so under load it can land on efficiency cores — a candidate
+    // cause of the 1.09 GHz effective-frequency collapse in heavy windows.
+    // The present thread already uses USER_INTERACTIVE; mirror it here
+    // (scheduling priority only, no rendering-logic change).
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
     g_T[5] = since_start();
     char **argv = g_boot_argv;
     { uint64_t r = front_game_res(1), r0 = front_game_res(0);   // 全屏验收④：与游戏建的交换链尺寸（WindowInitialize 行）对照 | Full-screen acceptance ④: compare with the swapchain size the game creates (the WindowInitialize line)
@@ -742,6 +752,7 @@ static void run_boot(void) {
 // and only what the system asks for is done (reattaching the download session, asset_dl.m); later the player taps the icon, the scene comes to the
 // foreground, and the host starts as usual.
 static int g_host_up;
+static int g_launcher_played;   // 启动器是否已点 Play：未点之前，场景到前台不自动起宿主
 static void log_promote(void) {   // 场景第一次到前台：这一轮是玩家真的在用，日志转正 | the scene comes to the foreground for the first time: this launch is the player really using the App, so the log is promoted
     static int done; if (done || ![g_mode isEqualToString:@"boot"]) return; done = 1;
     NSString *doc = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES)[0];
@@ -1139,8 +1150,26 @@ static void astc_handoff(UIWindow *w) {   // 补充包到位（玩家刚拷好 /
     vc.view.backgroundColor = UIColor.blackColor;
     if ([g_mode isEqualToString:@"boot"] && g_block_title) { vc = [BlockVC new]; vc.view.backgroundColor = UIColor.blackColor; }   // 图形芯片不支持 / 安装包不完整：只弹框 | Graphics chip not supported / install package incomplete: only show the message
     else if ([g_mode isEqualToString:@"boot"] && g_no_bc) { vc = [NoBcVC new]; vc.view.backgroundColor = UIColor.blackColor; }   // 本机型不支持：只弹框 | This device model is not supported: only show an alert
-    else if ([g_mode isEqualToString:@"boot"] && g_need_assets) vc = [AssetVC new];   // 资源包没到：下载界面 | Asset pack not here yet: download screen
-    else if ([g_mode isEqualToString:@"boot"]) vc.view = front_ios_view(ws.coordinateSpace.bounds);   // 图形后端出图的层（不叠任何控件） | The layer the graphics backend presents into (no widgets stacked on it)
+    else if ([g_mode isEqualToString:@"boot"]) {
+        // 启动器第 1 步：先出启动器，不直接进游戏。资源包没到时也不先出 AssetVC；
+        // 点 Play 后走 host_start()，内部 romfs_locate() 没过会经 astc_handoff 回 AssetVC。
+        // Launcher step 1: show the launcher first, not the game. Even when assets
+        // are missing, do not jump to AssetVC here; Play calls host_start(), whose
+        // romfs_locate() failure falls back to AssetVC via astc_handoff.
+        LauncherVC *launcher = [LauncherVC new];
+        __weak typeof(self) weakSelf = self;
+        launcher.onPlay = ^{
+            SceneDelegate *strongSelf = weakSelf;
+            if (!strongSelf) return;
+            g_launcher_played = 1;
+            DmGameVC *game = [DmGameVC new];
+            game.view = front_ios_view(strongSelf.window.windowScene.coordinateSpace.bounds);
+            strongSelf.window.rootViewController = game;
+            host_start();
+            if (g_host_up) front_ios_focus_event(3);
+        };
+        vc = launcher;
+    }
     else if ([g_mode isEqualToString:@"blank"]) { UIView *front_ios_blank_view(CGRect); vc.view = front_ios_blank_view(ws.coordinateSpace.bounds); }   // 发热负对照 | Heat negative control
     else {   // 探针模式：屏上标出模式名 | Probe mode: show the mode name on screen
         UILabel *l = [[UILabel alloc] initWithFrame:vc.view.bounds];
@@ -1153,7 +1182,7 @@ static void astc_handoff(UIWindow *w) {   // 补充包到位（玩家刚拷好 /
 }
 - (void)sceneWillResignActive:(UIScene *)s { if (g_host_up) front_ios_focus_event(0); }
 - (void)sceneDidEnterBackground:(UIScene *)s { if (g_host_up) front_ios_focus_event(1); }
-- (void)sceneWillEnterForeground:(UIScene *)s { log_promote(); if ([g_mode isEqualToString:@"boot"] && !g_need_assets && !g_no_bc && !g_block_title) { host_start(); if (g_host_up) front_ios_focus_event(2); } }
+- (void)sceneWillEnterForeground:(UIScene *)s { log_promote(); if ([g_mode isEqualToString:@"boot"] && g_launcher_played && !g_need_assets && !g_no_bc && !g_block_title) { host_start(); if (g_host_up) front_ios_focus_event(2); } }
 - (void)sceneDidBecomeActive:(UIScene *)s { if (g_host_up) front_ios_focus_event(3); }
 // 场景断开 / App 终止：宿主有序收尾后 _exit（hle_lifecycle.c）。注意：用户在多任务界面划掉一个已在后台挂起的 App 时，系统直接 SIGKILL，不走这两个回调
 // Scene disconnect / App termination: the host shuts down in order, then _exit (hle_lifecycle.c). Note: when the user swipes away an App already suspended in the background from the multitasking screen, the system sends SIGKILL directly and neither of these two callbacks runs
