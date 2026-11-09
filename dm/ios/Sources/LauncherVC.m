@@ -185,7 +185,8 @@ int mtl_fps_target(void);
 // dm_3d_scale_manual_set(0 = 自动，0.50–1.00 = 手动锁定）、dm_menu_fps_set(0 = 跟随自定义页，30 / 40 / 50 / 55 / 60 = 锁定）、
 // dm_aniso_set(-1 = 跟随游戏，1 = 关，2 / 4 / 8 / 16 = 强制档位）+ dm_aniso_apply_now（立即作废已建采样器缓存）、
 // dm_mtlfx_set(1 = 开，0 = 关）+ dm_mtlfx_get（只开关 scaler；底座降分辨率由启动时 front_game_res 的 DM_MTLFX_SPATIAL 定）。
-// dm_3d_quality_mode_set(0 = 流畅优先，1 = 画质优先）+ dm_3d_quality_mode_get（运行期立即生效；每启动默认流畅优先）。
+// dm_3d_quality_mode_get（q3d 的运行期生效值，0 = 流畅优先，1 = 画质优先；菜单画质行只用它读回显示，
+// 写不再直调 dm_3d_quality_mode_set，改走 dm_custom_set_immediate("q3d", …)：落盘 + 由 dm_custom 内部同步运行期值）。
 // Runtime setters the in-game menu calls (provided by nvn_mtl.m / hle_oe.c).
 void dm_3d_scale_manual_set(float v);
 float dm_3d_scale_manual_get(void);
@@ -575,16 +576,23 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
 // fallback while the menu is unlocked; a menu lock of 30 / 40 / 60 wins over
 // it. A missing fps key (launcher default 60) is likewise only the fallback
 // and never blocks the menu lock.
+// 画质模式行：显示值读 dm_3d_quality_mode_get()（q3d 的运行期生效值）；选中走
+// dm_custom_set_immediate("q3d", …) 写回——落盘持久 + 由 dm_custom 内部同步运行期
+// 值，与自定义页、DmGlassSettings 面板同一份存储、单写路径，重启不回落。
+// Quality mode row: the shown value reads dm_3d_quality_mode_get() (the live
+// q3d value); selections write through dm_custom_set_immediate("q3d", ...),
+// which persists and syncs the runtime value inside dm_custom — one shared
+// store and a single write path with the Custom page and DmGlassSettings.
 - (NSString *)menuQualityTitle {
     return dm_3d_quality_mode_get() == 1 ? @"画质优先" : @"流畅优先";
 }
 - (UIMenu *)menuQualityMenu {
     __weak typeof(self) weakSelf = self;
     UIAction *smooth = [UIAction actionWithTitle:@"流畅优先" image:nil identifier:nil handler:^(__kindof UIAction *a) {
-        typeof(self) s = weakSelf; if (!s) return; dm_3d_quality_mode_set(0); [s refreshMenu];
+        typeof(self) s = weakSelf; if (!s) return; dm_custom_set_immediate("q3d", 0); [s refreshMenu];
     }];
     UIAction *quality = [UIAction actionWithTitle:@"画质优先" image:nil identifier:nil handler:^(__kindof UIAction *a) {
-        typeof(self) s = weakSelf; if (!s) return; dm_3d_quality_mode_set(1); [s refreshMenu];
+        typeof(self) s = weakSelf; if (!s) return; dm_custom_set_immediate("q3d", 1); [s refreshMenu];
     }];
     BOOL isQuality = dm_3d_quality_mode_get() == 1;
     smooth.state = isQuality ? UIMenuElementStateOff : UIMenuElementStateOn;
