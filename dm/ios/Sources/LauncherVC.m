@@ -33,6 +33,12 @@
 //      menu_fps     0 跟随 / 30 / 40 / 50 / 55 / 60（游戏内菜单「帧率」锁定的存盘值：
 //                   菜单里选档即写盘，Play 时 syncToHost 恢复进 dm_menu_fps_set；
 //                   与启动器自己的 fps 键是两回事，优先级是菜单锁定 > DM_FPS 钉住）
+//      pace_adapt   0 / 1（自适应节拍：Play 时同步成环境变量 DM_PACE_ADAPT，
+//                   引擎 hle_nvn.c 首帧定节拍时读一次；缺省关 = 现状行为）
+//      shader_prep_threads  0 缺省 / 6 / 8（着色器预热线程数：Play 时同步成
+//                   环境变量 DM_SHADER_PREP_THREADS（0 时不设变量，走引擎缺省
+//                   核数-2、上限 6）；dm_shader_prep_begin 在 Play 回调里、
+//                   host_start 之前读，时序上赶得上）
 // Launcher settings file (separate from the in-game Custom page):
 //  - Documents/dm_launcher.txt, one "key=value" per line, keys:
 //      fps, opmode, upscaling (on / off: MetalFX Spatial real switch; docked renders
@@ -42,6 +48,13 @@
 //      menu_fps (the in-game menu's frame-rate lock: 0 follow / 30 / 40 / 50 / 55 / 60;
 //      written when picked in the menu, restored by syncToHost on Play;
 //      not the launcher's own fps key -- precedence: menu lock > DM_FPS pin).
+//      pace_adapt (0 / 1: adaptive pacing; synced to env DM_PACE_ADAPT on Play,
+//      read once by hle_nvn.c when the first frame fixes the pacing baseline;
+//      off by default = current behaviour).
+//      shader_prep_threads (0 default / 6 / 8: shader warm-up parallelism; synced
+//      to env DM_SHADER_PREP_THREADS on Play, left unset at 0 so the engine's own
+//      default of cores-2 capped at 6 applies; dm_shader_prep_begin reads it in
+//      the Play callback before host_start, so the timing works).
 //
 // 点 Play 时才同步给宿主的键（宿主在 host_start 之后、boot_prepare 里读盘 /
 // 启动时读一次环境变量，所以 Play 前写一定生效；跑起来后再改无效）：
@@ -50,6 +63,9 @@
 //  - 环境变量 DM_FPS_COUNTER：1 开 / 0 关（供排查与后续前端接线留档；
 //    本次的左上角显示由 LauncherVC 自己在 Play 后装的静态浮层窗口实现，
 //    见 DmFpsOverlayController，不依赖前端读这个变量）
+//  - 环境变量 DM_PACE_ADAPT：1 开 / 0 关（自适应节拍，hle_nvn.c 读一次）
+//  - 环境变量 DM_SHADER_PREP_THREADS：6 / 8（预热线程数，dm_shader_prep.m 读；
+//    设置里选缺省时不设这个变量）
 //  - sw_custom.txt：eco_fps（30 帧=1 / 60 帧=0）、lang（0 简中 / 1 英文）、
 //    touch_swap_above（0 / 1）；只改这三行，其余行原样保留。
 // On Play only, synced to the host (the host reads sw_custom.txt in
@@ -59,6 +75,9 @@
 //    and future front-end wiring; this branch's top-left overlay is installed
 //    by LauncherVC itself after Play, see DmFpsOverlayController, and does
 //    not depend on the front end reading this variable)
+//  - env DM_PACE_ADAPT (1/0, adaptive pacing, read once by hle_nvn.c),
+//    env DM_SHADER_PREP_THREADS (6 / 8, shader warm-up parallelism, read by
+//    dm_shader_prep.m; left unset when the setting is Default)
 //  - sw_custom.txt keys eco_fps, lang, touch_swap_above (only those three
 //    lines are touched).
 //
@@ -860,6 +879,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
 @property (nonatomic, assign) CGFloat menubtnX;  // 悬浮按钮横向位置（屏宽比例）
 @property (nonatomic, assign) CGFloat menubtnY;  // 悬浮按钮纵向位置（屏高比例）
 @property (nonatomic, assign) NSInteger menuFps;  // 游戏内菜单帧率锁定的存盘值：0 跟随 / 30 / 40 / 50 / 55 / 60（菜单里选档写盘，这里镜像读写防 saveSettings 洗掉，Play 时恢复）
+@property (nonatomic, assign) BOOL paceAdapt;  // 自适应节拍（环境变量 DM_PACE_ADAPT）：缺省关；Play 时 syncToHost 写环境变量，hle_nvn.c 首帧定节拍时读一次
 @property (nonatomic, strong) UIButton *anisoButton;
 @property (nonatomic, strong) UIButton *upscaleButton;
 @property (nonatomic, strong) UIVisualEffectView *rightGlass;
@@ -872,6 +892,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
 @property (nonatomic, strong) UISwitch *fpsCounterSwitch;
 @property (nonatomic, strong) UISwitch *touchSwapSwitch;
 @property (nonatomic, strong) UISwitch *framebufSwitch;
+@property (nonatomic, strong) UISwitch *paceAdaptSwitch;
 @property (nonatomic, strong) UILabel *memoryValueLabel;
 @property (nonatomic, strong) UILabel *memorySubtitleLabel;
 
@@ -896,6 +917,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
     self.menubtnX = 0.93;
     self.menubtnY = 0.12;
     self.menuFps = 0;
+    self.paceAdapt = NO;
 self.framebuf = YES;
     NSString *text = [NSString stringWithContentsOfFile:DmLauncherFile()
                                             encoding:NSUTF8StringEncoding error:nil];
@@ -946,6 +968,9 @@ self.framebuf = YES;
         // anything else all mean follow (0).
         self.menuFps = ([v isEqualToString:@"30"] || [v isEqualToString:@"40"] || [v isEqualToString:@"50"] || [v isEqualToString:@"55"] || [v isEqualToString:@"60"]) ? v.integerValue : 0;
     }
+    if ((v = DmLauncherValue(text, @"pace_adapt"))) {
+        self.paceAdapt = ![v isEqualToString:@"0"];
+    }
     }
     
 - (void)saveSettings {
@@ -954,11 +979,11 @@ self.framebuf = YES;
     // the menu-picked button position or the menu frame-rate lock.
     NSString *anisoStr = self.aniso == 1 ? @"off" : self.aniso == 2 ? @"2" : self.aniso == 4 ? @"4" : self.aniso == 8 ? @"8" : self.aniso == 16 ? @"16" : @"follow";
     NSString *text = [NSString stringWithFormat:
-        @"fps=%ld\nopmode=%ld\nupscaling=%@\naniso=%@\nlang=%@\nfps_counter=%d\ntouch_swap=%d\nframebuf=%d\nmenubtn_x=%.3f\nmenubtn_y=%.3f\nmenu_fps=%ld\n",
+        @"fps=%ld\nopmode=%ld\nupscaling=%@\naniso=%@\nlang=%@\nfps_counter=%d\ntouch_swap=%d\nframebuf=%d\nmenubtn_x=%.3f\nmenubtn_y=%.3f\nmenu_fps=%ld\npace_adapt=%d\n",
         (long)self.fps, (long)self.opmode, self.upscaling ? @"on" : @"off", anisoStr,
         self.lang == 1 ? @"en" : @"zh",
         self.fpsCounter ? 1 : 0, self.touchSwap ? 1 : 0, self.framebuf ? 1 : 0,
-        (double)self.menubtnX, (double)self.menubtnY, (long)self.menuFps];
+        (double)self.menubtnX, (double)self.menubtnY, (long)self.menuFps, self.paceAdapt ? 1 : 0];
     [text writeToFile:DmLauncherFile() atomically:YES
              encoding:NSUTF8StringEncoding error:nil];
 }
@@ -977,6 +1002,7 @@ self.framebuf = YES;
     self.menubtnX = 0.93;
     self.menubtnY = 0.12;
     self.menuFps = 0;
+    self.paceAdapt = NO;
 self.framebuf = YES;
     [self saveSettings];
 [self refreshControls];
@@ -989,6 +1015,17 @@ self.framebuf = YES;
     setenv("DM_OPMODE", self.opmode == 1 ? "1" : "0", 1);
     setenv("DM_LANG", self.lang == 1 ? "en-US" : "zh-Hans", 1);
     setenv("DM_FPS_COUNTER", self.fpsCounter ? "1" : "0", 1);
+    // 自适应节拍：开 = 出图节拍按屏幕实际刷新率取整除档、屏幕变频（LTPO）时保持
+    // 帧周期不变；关 = 现状。hle_nvn.c 的 pace_adapt_enabled 首帧定节拍时读一次
+    // 并缓存，所以必须 Play 前写、这里正合适。显式写 "0" 而不是不设：与引擎的
+    // 读法（*e == '1' 才开）对齐，也防外部环境里混进来的同名变量。
+    // Adaptive pacing: on = present pacing takes integer divisors of the actual
+    // screen refresh rate and holds the frame period across LTPO refresh changes;
+    // off = current behaviour. hle_nvn.c reads it once when the first frame fixes
+    // the pacing baseline and caches it, so it must be written before Play --
+    // exactly here. An explicit "0" (rather than leaving it unset) matches the
+    // engine's read (*e == '1' means on) and overrides any stray inherited value.
+    setenv("DM_PACE_ADAPT", self.paceAdapt ? "1" : "0", 1);
     setenv("DM_ANISO", self.aniso == 1 ? "off" : self.aniso == 2 ? "2" : self.aniso == 4 ? "4" : self.aniso == 8 ? "8" : self.aniso == 16 ? "16" : "follow", 1);
     setenv("DM_MTLFX_SPATIAL", self.upscaling ? "1" : "0", 1);
 setenv("DM_MAX_DRAWABLES", self.framebuf ? "3" : "2", 1);
@@ -1210,6 +1247,7 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
     self.upscaleButton.menu = [self upscaleMenu];
     self.fpsCounterSwitch.on = self.fpsCounter;
     self.touchSwapSwitch.on = self.touchSwap;
+    self.paceAdaptSwitch.on = self.paceAdapt;
     [self refreshMemory];
 }
 
@@ -1324,6 +1362,9 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
     self.framebufSwitch = [[UISwitch alloc] init];
     self.framebufSwitch.on = self.framebuf;
     [self.framebufSwitch addTarget:self action:@selector(framebufChanged:) forControlEvents:UIControlEventValueChanged];
+    self.paceAdaptSwitch = [[UISwitch alloc] init];
+    self.paceAdaptSwitch.on = self.paceAdapt;
+    [self.paceAdaptSwitch addTarget:self action:@selector(paceAdaptChanged:) forControlEvents:UIControlEventValueChanged];
     self.memoryValueLabel = [self labelWithText:@"— GB" size:16 bold:YES color:UIColor.labelColor];
     self.memoryValueLabel.textAlignment = NSTextAlignmentRight;
 
@@ -1340,6 +1381,7 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
         [self rowWithTitle:@"超分" subtitle:@"开：底座降分辨率渲染再放大；掌机只换放大算法" control:self.upscaleButton],
         [self rowWithTitle:@"各向异性" subtitle:@"远处地面与墙面斜看时的清晰度；开高会多吃一点 GPU" control:self.anisoButton],
 [self rowWithTitle:@"帧缓冲" subtitle:@"开=三缓冲（现状）；关=双缓冲，延迟低一点" control:self.framebufSwitch],
+        [self rowWithTitle:DmLauncherUI("dmLauncherPaceAdapt", @"自适应节拍") subtitle:DmLauncherUI("dmLauncherPaceAdaptHint", @"出图节拍按屏幕刷新率整除对齐，帧周期更稳") control:self.paceAdaptSwitch],
     [self rowWithTitle:@"游戏语言" subtitle:@"游戏内文本语言" control:self.langButton],
         [self rowWithTitle:@"帧数计数器" subtitle:@"左上角显示实时帧数" control:self.fpsCounterSwitch],
         [self rowWithTitle:@"按键" subtitle:@"传送门位置：关=传送门左侧，开=技能区上方；完整键位请进游戏后在 Options 里调" control:self.touchSwapSwitch],
@@ -1444,6 +1486,11 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
 
 - (void)framebufChanged:(UISwitch *)sender {
     self.framebuf = sender.on;
+    [self saveSettings];
+}
+
+- (void)paceAdaptChanged:(UISwitch *)sender {
+    self.paceAdapt = sender.on;
     [self saveSettings];
 }
 

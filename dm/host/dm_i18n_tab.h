@@ -93,6 +93,8 @@ static const struct { const char *k, *zh, *en, *es, *mx, *pt, *ru, *ko; } k_dm_i
     { "dmGlassQ3d", "3D 画质", "3D Quality", "Calidad 3D", "Calidad 3D", "Qualidade 3D", "Качество 3D", "3D 화질" },
     { "dmGlassDone", "完成", "Done", "Listo", "Listo", "Concluído", "Готово", "완료" },
     { "dmGlassOpen", "打开", "Open", "Abrir", "Abrir", "Abrir", "Открыть", "열기" },
+    { "dmLauncherPaceAdapt", "自适应节拍", "Adaptive pacing", "Ritmo adaptativo", "Ritmo adaptativo", "Ritmo adaptativo", "Адаптивный ритм", "적응형 페이싱" },
+    { "dmLauncherPaceAdaptHint", "出图节拍按屏幕刷新率整除对齐，帧周期更稳", "Aligns present pacing to integer divisors of the screen refresh rate for steadier frame times", "Alinea el ritmo de presentación a divisores enteros de la frecuencia de la pantalla", "Alinea el ritmo de presentación a divisores enteros de la frecuencia de la pantalla", "Alinha o ritmo de apresentação a divisores inteiros da taxa de atualização da tela", "Выравнивает ритм вывода по целочисленным делителям частоты экрана", "화면 주사율의 정수 배분에 맞춰 출력 리듬을 정렬" },
     { "dmCustomLootFilter", "掉落过滤（噩梦起自动隐藏杂物）", "Loot Filter (auto, Nightmare+)", "Filtro de botín (auto, Pesadilla+)", "Filtro de botín (auto, Pesadilla+)", "Filtro de saque (auto, Pesadelo+)", "Фильтр лута (авто, Кошмар+)", "루트 필터 (악몽부터 자동)" },
     { "dmCustomAutoBuff", "自动补上增益技能（站着不动时）", "Auto-recast buffs when idle", "Renovar mejoras al estar quieto", "Renovar mejoras al estar quieto", "Reaplicar bônus automaticamente quando parado", "Автоперекаст бафов в покое", "대기 중 버프 자동 재시전" },
     { "dmCustomLang", "语言", "Language", "Idioma", "Idioma", "Idioma", "Язык", "언어" },

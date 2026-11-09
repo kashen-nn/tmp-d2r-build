@@ -91,6 +91,8 @@ dmGlassTitle	设置	Settings	Ajustes		Configurações	Настройки	설정	
 dmGlassQ3d	3D 画质	3D Quality	Calidad 3D		Qualidade 3D	Качество 3D	3D 화질	毛玻璃面板里 q3d 两项的分节标题
 dmGlassDone	完成	Done	Listo		Concluído	Готово	완료	毛玻璃面板的关闭按钮
 dmGlassOpen	打开	Open	Abrir		Abrir	Открыть	열기	游戏内菜单最后一行打开毛玻璃设置面板的按钮（LauncherVC.m）
+dmLauncherPaceAdapt	自适应节拍	Adaptive pacing	Ritmo adaptativo	Ritmo adaptativo	Ritmo adaptativo	Адаптивный ритм	적응형 페이싱	启动器设置行标题：DM_PACE_ADAPT 开关（LauncherVC.m）
+dmLauncherPaceAdaptHint	出图节拍按屏幕刷新率整除对齐，帧周期更稳	Aligns present pacing to integer divisors of the screen refresh rate for steadier frame times	Alinea el ritmo de presentación a divisores enteros de la frecuencia de la pantalla	Alinea el ritmo de presentación a divisores enteros de la frecuencia de la pantalla	Alinha o ritmo de apresentação a divisores inteiros da taxa de atualização da tela	Выравнивает ритм вывода по целочисленным делителям частоты экрана	화면 주사율의 정수 배분에 맞춰 출력 리듬을 정렬	启动器设置行副标题：DM_PACE_ADAPT 开关（LauncherVC.m）
 dmCustomLootFilter	掉落过滤（噩梦起自动隐藏杂物）	Loot Filter (auto, Nightmare+)	Filtro de botín (auto, Pesadilla+)		Filtro de saque (auto, Pesadelo+)	Фильтр лута (авто, Кошмар+)	루트 필터 (악몽부터 자동)	自定义页开关；Loot Filter 是原版过滤器的英文名
 dmCustomAutoBuff	自动补上增益技能（站着不动时）	Auto-recast buffs when idle	Renovar mejoras al estar quieto		Reaplicar bônus automaticamente quando parado	Автоперекаст бафов в покое	대기 중 버프 자동 재시전	自定义页开关
 dmCustomLang	语言	Language	Idioma		Idioma	Язык	언어	自定义页语言那一行的标签：每种界面写自己语言的一个词（四个选项一排放不下两个词）
