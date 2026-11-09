@@ -127,7 +127,8 @@ static pthread_cond_t g_pq_cv = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t g_link_cv = PTHREAD_COND_INITIALIZER;
 static pthread_mutex_t g_link_mu = PTHREAD_MUTEX_INITIALIZER;
 static uint64_t g_link_tick_ns, g_link_tick_n;
-static uint64_t g_link_dropped;
+static _Atomic uint64_t g_link_dropped;   // 显示节拍层丢帧总账（单调递增）：节拍回调合并丢弃 + 进后台丢弃 + 节拍停摆兜底丢弃，全在 g_pq_mu 下加；对外由 dm_present_late_count 原子读 | The display-link layer's drop ledger (monotonic): merged away by the link callback + discarded on suspend + dropped by the link-stall fallback, all added under g_pq_mu; read externally via dm_present_late_count
+uint64_t dm_present_late_count(void) { return atomic_load(&g_link_dropped); }   // 强定义：hle_nvn.c 自适应出图档（pace_adapt）判降档的「错过节拍」计数（那边的弱定义恒 0）；语义与 [nvn] 上屏统计的「丢弃」同源——都是没赶上上屏节拍、最终没上屏的帧 | Strong definition: the "missed present slot" counter the adaptive present tier (pace_adapt in hle_nvn.c) judges step-downs by (the weak definition there is always 0); same source and semantics as the "discarded" count in the [nvn] present statistics -- frames that missed their present slot and never reached the screen
 static int g_pq_inflight;   // 持 g_pq_mu：已提交给 GPU、完成回调还没来的上屏数 | Under g_pq_mu: number of presents committed to the GPU whose completion callback has not arrived yet
 int g_dm_present_link;   // 出图节拍模式（DM_PRESENT_LINK 的运行时值，同进程交替测量时直接改它）：0 = 自己取 drawable；1 = 显示节拍 60 Hz；2 = 120 Hz 节拍、游戏隔拍出一帧 | Present pacing mode (runtime value of DM_PRESENT_LINK, modified directly during same-process alternating measurement): 0 = acquire the drawable itself; 1 = display link at 60 Hz; 2 = display link at 120 Hz, the game presents a frame every other display-link tick
 static int g_present_latency = 1;

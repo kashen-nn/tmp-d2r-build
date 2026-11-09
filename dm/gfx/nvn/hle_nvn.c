@@ -1378,7 +1378,7 @@ static void sleep_until_ns(uint64_t dl) {   // 单调时钟上的绝对时刻 | 
 // 4181 SaveIndicatorPanel entries and capped at 60 fps gives 0, which matches the ground truth), so uncapped is a semantically wrong way to run and must not be used as a criterion / cross-check / default. Unit tests set it directly with nvn_present_config
 static _Atomic int g_pa = -1; static int g_pa_k; static double g_pa_ema, g_pa_screen_hz; static unsigned g_pa_up; static uint64_t g_pa_last;
 static int pace_adapt_enabled(void) {
-    if (g_pa < 0) { const char *e = getenv("DM_PACE_ADAPT"); g_pa = e && *e == '1'; }
+    if (g_pa < 0) { const char *e = getenv("DM_PACE_ADAPT"); g_pa = e && *e == '1'; LOG("[nvn] 自适应出图档（DM_PACE_ADAPT）：%s", g_pa ? "开" : "关"); }   // 开关状态只在首次判定时记一行（升降档事件在 pace_adapt_tick 里另有日志） | The on/off state is logged once, at first resolution (step up/down events are logged separately in pace_adapt_tick)
     return g_pa;
 }
 static double present_auto_hz(double screen_hz) {
