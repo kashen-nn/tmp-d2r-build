@@ -880,6 +880,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
 @property (nonatomic, assign) CGFloat menubtnY;  // 悬浮按钮纵向位置（屏高比例）
 @property (nonatomic, assign) NSInteger menuFps;  // 游戏内菜单帧率锁定的存盘值：0 跟随 / 30 / 40 / 50 / 55 / 60（菜单里选档写盘，这里镜像读写防 saveSettings 洗掉，Play 时恢复）
 @property (nonatomic, assign) BOOL paceAdapt;  // 自适应节拍（环境变量 DM_PACE_ADAPT）：缺省关；Play 时 syncToHost 写环境变量，hle_nvn.c 首帧定节拍时读一次
+@property (nonatomic, assign) NSInteger prepThreads;  // 着色器预热线程数（环境变量 DM_SHADER_PREP_THREADS）：0 缺省（不设变量，引擎按核数-2、上限 6）/ 6 / 8；Play 时 syncToHost 写
 @property (nonatomic, strong) UIButton *anisoButton;
 @property (nonatomic, strong) UIButton *upscaleButton;
 @property (nonatomic, strong) UIVisualEffectView *rightGlass;
@@ -893,6 +894,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
 @property (nonatomic, strong) UISwitch *touchSwapSwitch;
 @property (nonatomic, strong) UISwitch *framebufSwitch;
 @property (nonatomic, strong) UISwitch *paceAdaptSwitch;
+@property (nonatomic, strong) UIButton *prepButton;
 @property (nonatomic, strong) UILabel *memoryValueLabel;
 @property (nonatomic, strong) UILabel *memorySubtitleLabel;
 
@@ -918,6 +920,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
     self.menubtnY = 0.12;
     self.menuFps = 0;
     self.paceAdapt = NO;
+    self.prepThreads = 0;
 self.framebuf = YES;
     NSString *text = [NSString stringWithContentsOfFile:DmLauncherFile()
                                             encoding:NSUTF8StringEncoding error:nil];
@@ -971,6 +974,12 @@ self.framebuf = YES;
     if ((v = DmLauncherValue(text, @"pace_adapt"))) {
         self.paceAdapt = ![v isEqualToString:@"0"];
     }
+    if ((v = DmLauncherValue(text, @"shader_prep_threads"))) {
+        // 只认 6 / 8 两档；0、缺省及其它值一律按缺省（不设环境变量）。
+        // Only 6 / 8 are honoured; 0, missing and anything else mean Default
+        // (the environment variable is left unset).
+        self.prepThreads = ([v isEqualToString:@"6"] || [v isEqualToString:@"8"]) ? v.integerValue : 0;
+    }
     }
     
 - (void)saveSettings {
@@ -979,17 +988,17 @@ self.framebuf = YES;
     // the menu-picked button position or the menu frame-rate lock.
     NSString *anisoStr = self.aniso == 1 ? @"off" : self.aniso == 2 ? @"2" : self.aniso == 4 ? @"4" : self.aniso == 8 ? @"8" : self.aniso == 16 ? @"16" : @"follow";
     NSString *text = [NSString stringWithFormat:
-        @"fps=%ld\nopmode=%ld\nupscaling=%@\naniso=%@\nlang=%@\nfps_counter=%d\ntouch_swap=%d\nframebuf=%d\nmenubtn_x=%.3f\nmenubtn_y=%.3f\nmenu_fps=%ld\npace_adapt=%d\n",
+        @"fps=%ld\nopmode=%ld\nupscaling=%@\naniso=%@\nlang=%@\nfps_counter=%d\ntouch_swap=%d\nframebuf=%d\nmenubtn_x=%.3f\nmenubtn_y=%.3f\nmenu_fps=%ld\npace_adapt=%d\nshader_prep_threads=%ld\n",
         (long)self.fps, (long)self.opmode, self.upscaling ? @"on" : @"off", anisoStr,
         self.lang == 1 ? @"en" : @"zh",
         self.fpsCounter ? 1 : 0, self.touchSwap ? 1 : 0, self.framebuf ? 1 : 0,
-        (double)self.menubtnX, (double)self.menubtnY, (long)self.menuFps, self.paceAdapt ? 1 : 0];
+        (double)self.menubtnX, (double)self.menubtnY, (long)self.menuFps, self.paceAdapt ? 1 : 0, (long)self.prepThreads];
     [text writeToFile:DmLauncherFile() atomically:YES
              encoding:NSUTF8StringEncoding error:nil];
 }
 
-// 重置：只重置启动器自己的十一个键，不删存档、不动游戏内其他设置。
-// Reset: only the launcher's own eleven keys, no save deletion, no other
+// 重置：只重置启动器自己的十三个键，不删存档、不动游戏内其他设置。
+// Reset: only the launcher's own thirteen keys, no save deletion, no other
 // in-game custom settings touched.
 - (void)resetSettings {
     self.fps = 60;
@@ -1003,6 +1012,7 @@ self.framebuf = YES;
     self.menubtnY = 0.12;
     self.menuFps = 0;
     self.paceAdapt = NO;
+    self.prepThreads = 0;
 self.framebuf = YES;
     [self saveSettings];
 [self refreshControls];
@@ -1026,6 +1036,25 @@ self.framebuf = YES;
     // exactly here. An explicit "0" (rather than leaving it unset) matches the
     // engine's read (*e == '1' means on) and overrides any stray inherited value.
     setenv("DM_PACE_ADAPT", self.paceAdapt ? "1" : "0", 1);
+    // 着色器预热线程数：dm_shader_prep.m 的缺省 = 核数-2 并夹在 [2, 6]，环境变量
+    // DM_SHADER_PREP_THREADS 给正数就原样用（不夹）。选 6 = 顶到缺省上限（核少的
+    // 机器比缺省多，如 6 核机缺省 4）；选 8 = 超过缺省上限、首启预编更快，代价是
+    // 那几分钟更吃 CPU / 发热。缺省档不设变量，保持引擎原行为。时序：prep 在
+    // main.m 的 Play 回调里、host_start 之前才调 dm_shader_prep_begin 读这个变量，
+    // syncToHost 在它之前跑，赶得上（仅壳包 DM_SHELL 有这个预编环节）。
+    // Shader warm-up threads: dm_shader_prep.m's default is cores-2 clamped to
+    // [2, 6]; a positive DM_SHADER_PREP_THREADS is used verbatim (unclamped).
+    // 6 tops out the default cap (more than default on low-core devices, e.g.
+    // 4 on a 6-core phone); 8 exceeds the cap and pre-compiles faster on first
+    // launch, at the cost of more CPU / heat for those minutes. Default leaves
+    // the variable unset, keeping the engine's own behaviour. Timing: prep reads
+    // it in dm_shader_prep_begin, called from main.m's Play callback before
+    // host_start -- after syncToHost runs (shell packages with DM_SHELL only).
+    if (self.prepThreads > 0) {
+        setenv("DM_SHADER_PREP_THREADS", [NSString stringWithFormat:@"%ld", (long)self.prepThreads].UTF8String, 1);
+    } else {
+        unsetenv("DM_SHADER_PREP_THREADS");
+    }
     setenv("DM_ANISO", self.aniso == 1 ? "off" : self.aniso == 2 ? "2" : self.aniso == 4 ? "4" : self.aniso == 8 ? "8" : self.aniso == 16 ? "16" : "follow", 1);
     setenv("DM_MTLFX_SPATIAL", self.upscaling ? "1" : "0", 1);
 setenv("DM_MAX_DRAWABLES", self.framebuf ? "3" : "2", 1);
@@ -1220,6 +1249,31 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
     return self.upscaling ? @"开" : @"关";
 }
 
+// 着色器预热线程数下拉：0 缺省 / 6 / 8（存的值就是线程数，0 = 不设环境变量）。
+// Shader warm-up threads dropdown: 0 Default / 6 / 8 (the stored value is the
+// thread count; 0 = the environment variable is left unset).
+- (UIMenu *)prepThreadsMenu {
+    __weak typeof(self) weakSelf = self;
+    NSArray<NSNumber *> *vals = @[@(0), @(6), @(8)];
+    NSArray<NSString *> *names = @[DmLauncherUI("dmLauncherPrepAuto", @"缺省"), DmLauncherUI("dmLauncherPrep6", @"6 线程"), DmLauncherUI("dmLauncherPrep8", @"8 线程")];
+    NSMutableArray<UIAction *> *acts = [NSMutableArray array];
+    for (NSUInteger i = 0; i < vals.count; i++) {
+        NSNumber *v = vals[i];
+        UIAction *a = [UIAction actionWithTitle:names[i] image:nil identifier:nil handler:^(__kindof UIAction *act) {
+            typeof(self) s = weakSelf; if (!s) return; s.prepThreads = v.integerValue; [s saveSettings]; [s refreshControls];
+        }];
+        a.state = self.prepThreads == v.integerValue ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [acts addObject:a];
+    }
+    return [UIMenu menuWithTitle:@"" children:acts];
+}
+
+- (NSString *)prepThreadsTitle {
+    if (self.prepThreads == 6) return DmLauncherUI("dmLauncherPrep6", @"6 线程");
+    if (self.prepThreads == 8) return DmLauncherUI("dmLauncherPrep8", @"8 线程");
+    return DmLauncherUI("dmLauncherPrepAuto", @"缺省");
+}
+
 - (NSString *)anisoTitle {
     switch (self.aniso) {
         case 1: return @"关";
@@ -1245,6 +1299,8 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
     self.anisoButton.menu = [self anisoMenu];
     [self.upscaleButton setTitle:[NSString stringWithFormat:@"%@ ▾", [self upscaleTitle]] forState:UIControlStateNormal];
     self.upscaleButton.menu = [self upscaleMenu];
+    [self.prepButton setTitle:[NSString stringWithFormat:@"%@ ▾", [self prepThreadsTitle]] forState:UIControlStateNormal];
+    self.prepButton.menu = [self prepThreadsMenu];
     self.fpsCounterSwitch.on = self.fpsCounter;
     self.touchSwapSwitch.on = self.touchSwap;
     self.paceAdaptSwitch.on = self.paceAdapt;
@@ -1351,6 +1407,7 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
 
     self.langButton = [self dropdownButtonWithTitle:self.lang == 1 ? @"English" : @"简体中文" menu:[self langMenu]];
     self.anisoButton = [self dropdownButtonWithTitle:[self anisoTitle] menu:[self anisoMenu]];
+    self.prepButton = [self dropdownButtonWithTitle:[self prepThreadsTitle] menu:[self prepThreadsMenu]];
 
     self.fpsCounterSwitch = [[UISwitch alloc] init];
     self.fpsCounterSwitch.on = self.fpsCounter;
@@ -1382,6 +1439,7 @@ setenv("DM_RT_AB", "0", 1); // 30+30 已从启动器删除，外推固定关闭
         [self rowWithTitle:@"各向异性" subtitle:@"远处地面与墙面斜看时的清晰度；开高会多吃一点 GPU" control:self.anisoButton],
 [self rowWithTitle:@"帧缓冲" subtitle:@"开=三缓冲（现状）；关=双缓冲，延迟低一点" control:self.framebufSwitch],
         [self rowWithTitle:DmLauncherUI("dmLauncherPaceAdapt", @"自适应节拍") subtitle:DmLauncherUI("dmLauncherPaceAdaptHint", @"出图节拍按屏幕刷新率整除对齐，帧周期更稳") control:self.paceAdaptSwitch],
+        [self rowWithTitle:DmLauncherUI("dmLauncherPrepThreads", @"着色器预热线程") subtitle:DmLauncherUI("dmLauncherPrepThreadsHint", @"首次启动预编着色器时的并行数；越高编得越快，也越吃 CPU 和发热") control:self.prepButton],
     [self rowWithTitle:@"游戏语言" subtitle:@"游戏内文本语言" control:self.langButton],
         [self rowWithTitle:@"帧数计数器" subtitle:@"左上角显示实时帧数" control:self.fpsCounterSwitch],
         [self rowWithTitle:@"按键" subtitle:@"传送门位置：关=传送门左侧，开=技能区上方；完整键位请进游戏后在 Options 里调" control:self.touchSwapSwitch],
