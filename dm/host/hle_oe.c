@@ -322,6 +322,7 @@ static void s3g_feed(double iv_ms) {
 }
 void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_perf_present 转来）：实际上屏间隔 ms，−1 = 被丢弃，0 = 无读数 | called by the present thread every frame (forwarded from diag.c dm_perf_present): actual present interval in ms, −1 = dropped, 0 = no reading
     static scale3d_ctl c; static int on = -1; static long inj0 = -1, inj1 = -1; static float fl, mcfg = -1;
+    static uint64_t cpu_last; static double cpu_acc; static unsigned cpu_n;   // 降档抑制的 CPU 绑归因（见下面 ctl_step 前的累计）：实判时段内的提交 CPU 累计 ms 与帧数 | CPU-bound attribution for step-down suppression (accumulated before ctl_step below): submit CPU ms and frame count over live-judging spans
     if (on < 0) { const char *e = getenv("DM_3D_SCALE_DYN"), *j = getenv("DM_3D_SCALE_DYN_INJECT"); on = !(e && !strcmp(e, "0")) && !getenv("DM_THERMAL_NOFALLBACK");
         if (j) { inj0 = atol(j); inj1 = strchr(j, '-') ? atol(strchr(j, '-') + 1) : inj0; }
         // 下限：档位表里不低于它的最深一档
@@ -340,13 +341,50 @@ void dm_3d_scale_feed(double iv_ms) {   // 出图线程每帧调（diag.c dm_per
     if (atomic_exchange(&g_scale3d_resumed, 0)) scale3d_ctl_hold(&c, now, 3 * S3_SEC);
     { static int was; int in = dm_ingame_now();   // 不在局内（菜单 / 读取）不判；刚进局的 20 秒也不判（进局头十几秒的慢帧是装载，不是 GPU 吃紧） | not judged outside a run (menu / loading); not judged in the first 20 seconds of a run either (slow frames in the first ten-odd seconds of a run are loading, not GPU pressure)
       if (!in) { was = 0; scale3d_ctl_hold(&c, now, S3_SEC); return; }
-      if (!was) { was = 1; if (inj0 < 0) scale3d_ctl_hold(&c, now, 20 * S3_SEC); } }
+      if (!was) { was = 1; cpu_last = dm_nvn_sub_cpu_ns(); cpu_acc = 0; cpu_n = 0; if (inj0 < 0) scale3d_ctl_hold(&c, now, 20 * S3_SEC); } }   // 进局：CPU 归因基线从这里重起（跨局 / 跨菜单的累计差分没有意义） | entering a run: the CPU attribution baseline restarts here (deltas spanning runs / menus are meaningless)
     { int mtl_fps_target(void); double mtl_display_refresh(void), dm_pace_hz(double, double), r = mtl_display_refresh(); int tgt = mtl_fps_target(); double hz = dm_pace_hz(r, 60);
       double p = (tgt == 50 || tgt == 55) ? 1000.0 / tgt : tgt != 60 ? 1000.0 / dm_pace_hz(r, tgt) : hz != 60 ? 1000.0 / hz : 0; if (p != c.period_ms) { c.period_ms = p; scale3d_ctl_hold(&c, now, 2 * S3_SEC); } }   // 目标周期跟着帧率目标换：30 / 40 锁定档各按自己的周期判（旧式只认 30，40 档回落到 60 帧的 16.7 ms 周期，正常的 25 ms 帧全在掉帧阈值边缘、窗内计数失真）；50 / 55 非整除档没有整除档可取（dm_pace_hz 会把 50 / 55 抬到 60、周期变回 16.7 ms，交替出现的 25.01 ms 正常长间隔会被当掉帧），直接按真实目标周期判（50 → 20.0 ms、55 → 18.18 ms；软节拍下间隔在 16.67 / 25.01 ms 间交替，1.5 倍周期分别是 30 / 27.3 ms，长间隔不误判）；非 60 倍数的屏取整除档（如 144 Hz 屏 72），切换后停判 2 秒。软节拍（nvn_mtl 模式 3）下上屏间隔 = 产帧跨度按一个刷新粒度取整，节拍等待只出现在帧提前备好时、不会把间隔拉过周期，所以按 1.5 倍周期判掉帧即是按产帧耗时判 | The target period follows the frame-rate target: the 30 / 40 locks are each judged by their own period (the old form only knew 30, so a 40 lock fell back to the 60 fps period of 16.7 ms, leaving normal 25 ms frames right at the drop threshold and distorting the window counts); the 50 / 55 non-divisor tiers have no divisor tier to take (dm_pace_hz would raise 50 / 55 to 60 and the period would fall back to 16.7 ms, counting the alternating normal 25.01 ms long intervals as drops), so they are judged by the real target period (50 -> 20.0 ms, 55 -> 18.18 ms; under soft pacing the intervals alternate between 16.67 and 25.01 ms, and 1.5x the period is 30 / 27.3 ms, so the long intervals are not miscounted); screens not a multiple of 60 take the evenly dividing tier (e.g. 72 on a 144 Hz screen); checking pauses for 2 seconds after a switch. Under soft pacing (nvn_mtl mode 3) the present interval is the frame production span rounded to one refresh of granularity, and pacing wait only appears when a frame was ready early and never stretches an interval past the period, so judging drops at 1.5x the period is judging by production cost
     if (inj0 >= 0) { long f = (long)dm_nvn_frame_count(); double per = c.period_ms > 0 ? c.period_ms : 1000.0 / 60; iv_ms = f >= inj0 && f <= inj1 ? 2 * per : per; }   // 注入：段内每帧当掉一帧（两个周期） | Injection: every frame within the segment counts as a dropped frame (two periods)
-    int was = c.level, lv = scale3d_ctl_step(&c, iv_ms, now);
-    if (lv != was) LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%% → %s到第 %d 档（3D 比例 %.2f）%s", c.last_r10 * 100, c.last_r60 * 100, lv > was ? "降" : "升", lv,
+    // CPU 绑归因累计（降档抑制用）：只在真判的时段（now ≥ hold_until，与控制器同口径）累计提交 CPU
+    // （dm_nvn_sub_cpu_ns，与 [perf] / 降档诊断同源的现读累计值，差分得本段耗时）。判据为何只看提交 CPU：
+    // 它量的是提交线程真烧掉的 CPU（现等空闲已扣除、栅栏 / 出图等待的现读也只收忙等段）——GPU 绑的帧里
+    // 提交线程停在栅栏等待上、不烧 CPU，所以提交 CPU 占周期比高本身就证明瓶颈在 CPU 侧；GPU p95 的现成
+    // 读数 nvn_gpu_recent 是 front_ios 发热归因的消费型接口（读走即清、10 秒一读），这里不抢它的样本。
+    // CPU-bound attribution accumulation (for step-down suppression): only over live-judging spans
+    // (now >= hold_until, the controller's own criterion), accumulate submit CPU (dm_nvn_sub_cpu_ns --
+    // the same live cumulative counter as [perf] and the step-down diagnostics -- differenced over the
+    // span). Why submit CPU alone decides: it measures CPU the submit threads actually burned (reader
+    // waits excluded, and the fence / present waits only count their busy segments) -- in GPU-bound
+    // frames the submit thread parks in fence waits and burns no CPU, so a high submit-CPU share of
+    // the frame period by itself proves the bottleneck is on the CPU side. The ready GPU p95 reader
+    // (nvn_gpu_recent) is a consuming interface owned by front_ios heat attribution (clears on read,
+    // one read per 10 s); the samples are not stolen from it here.
+    if (now >= c.hold_until) { uint64_t cn = dm_nvn_sub_cpu_ns();
+        if (cpu_last && cn >= cpu_last && cn - cpu_last < 100000000ull) { cpu_acc += (cn - cpu_last) / 1e6; cpu_n++; }   // 单帧差分 ≥ 100 ms 必是基线漂移（跨模式 / 跨局），不入账 | a single-frame delta >= 100 ms can only be baseline drift (across modes / runs); not counted
+        cpu_last = cn; }
+    else { cpu_last = dm_nvn_sub_cpu_ns(); cpu_acc = 0; cpu_n = 0; }   // 停判期不累计（与控制器同口径） | hold spans are not accumulated (same criterion as the controller)
+    int was = c.level, ng0 = c.need_good; uint64_t lu0 = c.last_up;
+    int lv = scale3d_ctl_step(&c, iv_ms, now);
+    if (lv > was) {   // 本要降档：归因不过就别降——降 3D 分辨率只省 GPU，CPU 绑时降了纯糊画面
+        // 阈值出处：诊断局（boot.txt 2026-11-09）的提交 CPU 好窗约 3–4 ms/帧（占 60 档周期 20% 上下）、
+        // 坏窗 9–14 ms/帧（占周期 55–85%）；0.60 落在两团之间偏保守侧。样本下限 120 帧：稳态降档判据
+        // 本身要 5 个满窗（约 10 秒），实判段累计恒多于此，120 只是挡刚起步的稀疏样本。
+        // Threshold provenance: in the diagnosed session (boot.txt, 2026-11-09) submit CPU ran about
+        // 3-4 ms/frame in healthy windows (about 20% of the 60-tier period) and 9-14 ms/frame in bad
+        // windows (55-85% of the period); 0.60 sits between the two clusters, on the conservative
+        // side. Sample floor 120 frames: the steady-state step-down itself needs 5 full windows
+        // (about 10 s), so live-judging spans always hold more than that; 120 only rejects sparse
+        // just-started samples.
+        double per = c.period_ms > 0 ? c.period_ms : 1000.0 / 60, cms = cpu_n ? cpu_acc / cpu_n : 0;
+        if (cpu_n >= 120 && cms >= 0.60 * per) {
+            c.level = was; c.need_good = ng0; c.last_up = lu0; scale3d_ctl_hold(&c, now, 3 * S3_SEC);   // 撤回降档并恢复升档进度（与一次「档变了」等价的停判 3 秒探活） | undo the step-down and restore the step-up progress (a 3 s judging pause to re-probe, as after any level change)
+            LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%%，本应降到第 %d 档，但提交 CPU %.1f ms/帧占周期 %.0f%%（瓶颈在 CPU，降分辨率不省 CPU）→ 不降，停判 3 秒", c.last_r10 * 100, c.last_r60 * 100, lv, cms, cms / per * 100);
+            lv = was; cpu_acc = 0; cpu_n = 0; cpu_last = dm_nvn_sub_cpu_ns();
+        }
+    }
+    if (lv != was) { LOG("3D 比例控制：最近 10 秒掉帧 %.1f%%、60 秒 %.1f%% → %s到第 %d 档（3D 比例 %.2f）%s", c.last_r10 * 100, c.last_r60 * 100, lv > was ? "降" : "升", lv,
                        s3_level_scale(s3_cfg(), lv), c.need_good ? "（刚升又掉：下次升档要 90 秒）" : "");
+        cpu_acc = 0; cpu_n = 0; cpu_last = dm_nvn_sub_cpu_ns(); }   // 档变了：归因窗从新档重新累计 | the level changed: the attribution span restarts from the new level
     atomic_store(&g_scale3d_level, lv);
 }
 void dm_3d_scale_hot(int hot) { (void)hot; }   // 过热不再直接降档（改按实际掉帧）；保留符号给前端 | overheating no longer lowers the level directly (now by actual dropped frames); the symbol is kept for the front end

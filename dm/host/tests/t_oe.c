@@ -14,6 +14,7 @@ uint64_t now_ns(void) { return 0; }
 module_t g_mod[MAX_MOD]; int g_nmod;
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
 uint64_t dm_nvn_frame_count(void) { return 0; }
+uint64_t dm_nvn_sub_cpu_ns(void) { return 0; }   // 提交 CPU 累计（hle_nvn.c）：单测里恒 0 → 3D 降档抑制的归因差分恒 0、永不抑制，控制器本体用例不受影响 | submit CPU cumulative (hle_nvn.c): always 0 in unit tests -> the 3D step-down suppression deltas are always 0 and never suppress, so the controller's own cases are unaffected
 int dm_nvn_ruler_truth(void) { return 0; }
 int dm_ingame_now(void) { return 1; }
 int mtl_fps_target(void) { return 60; }   // 目标帧率（nvn_mtl.m）：单测里恒为 60，30 帧档的用例直接给 period_ms | target frame rate (nvn_mtl.m): always 60 in the unit test, and the 30 fps mode cases pass period_ms directly
