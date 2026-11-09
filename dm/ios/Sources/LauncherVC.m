@@ -97,6 +97,8 @@
 // so flipping it live does not change the output size.
 
 #import "LauncherVC.h"
+#import "DmGlassSettings.h"
+#include "../../host/dm_i18n.h"
 #include <stdlib.h>
 #include <os/proc.h>
 
@@ -144,6 +146,16 @@ static NSString *DmLauncherReplace(NSString *text, NSDictionary<NSString *, NSSt
         }
     }
     return [[out componentsJoinedByString:@"\n"] stringByAppendingString:@"\n"];
+}
+
+// 新增行的文案走多语表（dm/i18n/ui_text.tsv，dm_ui 按当前语言取串）；表里取不到
+// 时回落给定的中文，与本文件其余硬编码中文行同表现。
+// Text for newly added rows comes from the string table (dm/i18n/ui_text.tsv,
+// dm_ui picks by current language); when the table has nothing, fall back to the
+// given Chinese, matching the rest of this file's hardcoded Chinese rows.
+static NSString *DmLauncherUI(const char *key, NSString *fallback) {
+    const char *s = dm_ui(key);
+    return s && *s ? [NSString stringWithUTF8String:s] : fallback;
 }
 
 #pragma mark - FPS overlay (installed by the launcher after Play)
@@ -314,11 +326,16 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
 @interface DmMenuRootView : UIView
 @property (nonatomic, weak) UIView *buttonView;
 @property (nonatomic, weak) UIView *panelView;
+@property (nonatomic, weak) UIView *glassView;   // 毛玻璃设置面板的遮罩（开着时整屏归它）| the glass panel's shade (owns the whole screen while open)
 @property (nonatomic, assign) BOOL menuOpen;
 @end
 
 @implementation DmMenuRootView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
+    // 毛玻璃面板是模态的：开着时先于悬浮按钮 / 菜单面板判定，整屏触摸归它。
+    // The glass panel is modal: while open it is hit-tested before the floating
+    // button / menu panel and takes the whole screen.
+    if (self.glassView && self.glassView.superview == self && CGRectContainsPoint(self.glassView.frame, point)) return [super hitTest:point withEvent:event];
     if (self.buttonView && CGRectContainsPoint(CGRectInset(self.buttonView.frame, -10, -10), point)) return [super hitTest:point withEvent:event];
     if (self.menuOpen && self.panelView && CGRectContainsPoint(self.panelView.frame, point)) return [super hitTest:point withEvent:event];
     return nil;
@@ -344,6 +361,7 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
 @property (nonatomic, strong) UIButton *menuVfxButton;
 @property (nonatomic, strong) UIButton *menuFpsButton;
 @property (nonatomic, strong) UIButton *menuAnisoButton;
+@property (nonatomic, strong) UIButton *menuGlassButton;
 @property (nonatomic, strong) UISwitch *menuMfxSwitch;
 @property (nonatomic, strong) UISwitch *menuFpsSwitch;
 @property (nonatomic, assign) CGPoint panStart;
@@ -636,6 +654,17 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
     [self.menuMfxSwitch addTarget:self action:@selector(mfxSwitchChanged:) forControlEvents:UIControlEventValueChanged];
     self.menuFpsSwitch = [[UISwitch alloc] init];
     [self.menuFpsSwitch addTarget:self action:@selector(fpsSwitchChanged:) forControlEvents:UIControlEventValueChanged];
+    // 毛玻璃设置面板入口（DmGlassSettings，原 main 线面板）：行尾「打开」按钮，
+    // 点了先关本菜单、再以菜单根视图为宿主把面板盖到游戏画面上（见 glassTapped）。
+    // Entry to the frosted-glass settings panel (DmGlassSettings, the original
+    // main-line panel): an Open button at the row's end; tapping closes this menu
+    // and presents the panel over the game picture on the menu root view.
+    self.menuGlassButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.menuGlassButton setTitle:DmLauncherUI("dmGlassOpen", @"打开") forState:UIControlStateNormal];
+    self.menuGlassButton.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+    [self.menuGlassButton setTitleColor:UIColor.whiteColor forState:UIControlStateNormal];
+    self.menuGlassButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentRight;
+    [self.menuGlassButton addTarget:self action:@selector(glassTapped) forControlEvents:UIControlEventTouchUpInside];
     self.menuMfxSwitch.thumbTintColor = UIColor.whiteColor;
     self.menuMfxSwitch.onTintColor = UIColor.systemBlueColor;
     self.menuFpsSwitch.thumbTintColor = UIColor.whiteColor;
@@ -650,6 +679,7 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
         [self menuRowWithTitle:@"各向异性" control:self.menuAnisoButton],
         [self menuRowWithTitle:@"超分" control:self.menuMfxSwitch],
         [self menuRowWithTitle:@"FPS 显示" control:self.menuFpsSwitch],
+        [self menuRowWithTitle:DmLauncherUI("dmGlassTitle", @"设置") control:self.menuGlassButton],
     ];
     for (UIView *row in self.menuRows) [panel.contentView addSubview:row];
     // 行间细分隔线（更好看）：除最后一行外每行底加一条半透明细线；tag 777，布局时跳过控件查找。
@@ -692,6 +722,20 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
     [self refreshMenu];
 }
 
+// 毛玻璃设置面板：先关菜单（两块玻璃面板不同时开），以根视图为宿主打开面板，
+// 并把面板遮罩登记给根视图的 hitTest（面板开着时整屏触摸归它）；面板自己关掉
+//（完成按钮 / 点遮罩空白处）后遮罩移除，弱引用自动清空，不用这边收尾。
+// Frosted-glass panel: close this menu first (never two glass panels at once),
+// present the panel on the root view, and register its shade with the root
+// view's hitTest (while open, the shade owns the screen). When the panel closes
+// itself (Done button / tap on the shade) the shade is removed and the weak
+// reference clears itself; nothing to clean up here.
+- (void)glassTapped {
+    [self closeMenu];
+    dm_glass_present(self.rootView);
+    self.rootView.glassView = dm_glass_shade_view();
+}
+
 - (void)refreshMenu {
     if (!self.started) return;
     [self.menuScaleButton setTitle:[NSString stringWithFormat:@"%@ ▾", [self scaleSelectionTitle]] forState:UIControlStateNormal];
@@ -706,6 +750,12 @@ static DmFpsOverlayController *DmFpsOverlayShared(void) {
     self.menuAnisoButton.menu = [self menuAnisoMenu];
     self.menuFpsSwitch.on = [DmFpsOverlayShared() visible];
     self.menuMfxSwitch.on = dm_mtlfx_get() == 1;
+    // 毛玻璃行文案在装菜单时按当时的语言取的，刷新时重取一次（语言在游戏起来后才定死）。
+    // The glass row's text was taken at install time; re-take it on refresh (the
+    // language only settles once the game is up).
+    [self.menuGlassButton setTitle:DmLauncherUI("dmGlassOpen", @"打开") forState:UIControlStateNormal];
+    UILabel *glassTitle = (UILabel *)self.menuRows.lastObject.subviews.firstObject;
+    if ([glassTitle isKindOfClass:UILabel.class]) glassTitle.text = DmLauncherUI("dmGlassTitle", @"设置");
     self.menuFootnote.text = [NSString stringWithFormat:@"当前 3D 比例 %.2f · 帧率目标 %d · 超分 %@", dm_3d_scale_cur(), mtl_fps_target(), dm_mtlfx_get() == 1 ? @"开" : @"关"];
     [self.rootView setNeedsLayout];   // 帧率行控件显隐 / 下拉标题变长后重摆
 }

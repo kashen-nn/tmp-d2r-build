@@ -92,6 +92,7 @@ static const struct { const char *k, *zh, *en, *es, *mx, *pt, *ru, *ko; } k_dm_i
     { "dmGlassTitle", "设置", "Settings", "Ajustes", "Ajustes", "Configurações", "Настройки", "설정" },
     { "dmGlassQ3d", "3D 画质", "3D Quality", "Calidad 3D", "Calidad 3D", "Qualidade 3D", "Качество 3D", "3D 화질" },
     { "dmGlassDone", "完成", "Done", "Listo", "Listo", "Concluído", "Готово", "완료" },
+    { "dmGlassOpen", "打开", "Open", "Abrir", "Abrir", "Abrir", "Открыть", "열기" },
     { "dmCustomLootFilter", "掉落过滤（噩梦起自动隐藏杂物）", "Loot Filter (auto, Nightmare+)", "Filtro de botín (auto, Pesadilla+)", "Filtro de botín (auto, Pesadilla+)", "Filtro de saque (auto, Pesadelo+)", "Фильтр лута (авто, Кошмар+)", "루트 필터 (악몽부터 자동)" },
     { "dmCustomAutoBuff", "自动补上增益技能（站着不动时）", "Auto-recast buffs when idle", "Renovar mejoras al estar quieto", "Renovar mejoras al estar quieto", "Reaplicar bônus automaticamente quando parado", "Автоперекаст бафов в покое", "대기 중 버프 자동 재시전" },
     { "dmCustomLang", "语言", "Language", "Idioma", "Idioma", "Idioma", "Язык", "언어" },
