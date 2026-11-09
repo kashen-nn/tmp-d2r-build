@@ -887,7 +887,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
 @property (nonatomic, assign) CGFloat menubtnX;  // 悬浮按钮横向位置（屏宽比例）
 @property (nonatomic, assign) CGFloat menubtnY;  // 悬浮按钮纵向位置（屏高比例）
 @property (nonatomic, assign) NSInteger menuFps;  // 游戏内菜单帧率锁定的存盘值：0 跟随 / 30 / 40 / 50 / 55 / 60（菜单里选档写盘，这里镜像读写防 saveSettings 洗掉，Play 时恢复）
-@property (nonatomic, assign) BOOL paceAdapt;  // 自适应节拍（环境变量 DM_PACE_ADAPT）：缺省关；Play 时 syncToHost 写环境变量，hle_nvn.c 首帧定节拍时读一次
+@property (nonatomic, assign) BOOL paceAdapt;  // 自适应节拍（环境变量 DM_PACE_ADAPT）：缺省开（存盘里有 pace_adapt 键时按存盘值）；Play 时 syncToHost 写环境变量，hle_nvn.c 首帧定节拍时读一次
 @property (nonatomic, assign) NSInteger prepThreads;  // 着色器预热线程数（环境变量 DM_SHADER_PREP_THREADS）：0 缺省（不设变量，引擎按核数-2、上限 6）/ 6 / 8；Play 时 syncToHost 写
 @property (nonatomic, strong) UIButton *anisoButton;
 @property (nonatomic, strong) UIButton *upscaleButton;
@@ -927,7 +927,7 @@ static DmGameMenuController *DmGameMenuShared(void) {
     self.menubtnX = 0.93;
     self.menubtnY = 0.12;
     self.menuFps = 0;
-    self.paceAdapt = NO;
+    self.paceAdapt = YES;
     self.prepThreads = 0;
 self.framebuf = YES;
     NSString *text = [NSString stringWithContentsOfFile:DmLauncherFile()
@@ -1019,7 +1019,7 @@ self.framebuf = YES;
     self.menubtnX = 0.93;
     self.menubtnY = 0.12;
     self.menuFps = 0;
-    self.paceAdapt = NO;
+    self.paceAdapt = YES;
     self.prepThreads = 0;
 self.framebuf = YES;
     [self saveSettings];
