@@ -1695,6 +1695,17 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     uint64_t slot = now + nvn_pace(&pc, now, period);
     o->pace = pc.target;
     if (idx >= 0 && idx < 4) o->avail[idx] = period ? slot + period : 0;
+    // 写者侧留痕（纯日志，不改任何值）：avail / pace 构造上至多领先 now 两个周期；某次出图写出超过
+    // now + 4 周期的时刻，就是 boot-7 那种整环位移的诞生瞬间——日后靠这一行抓写歪的代码路径。
+    // 节流：同一秒至多一行（位移形成期间出图仍在跑，避免刷屏）。
+    // Writer-side trace (log only, changes no value): by construction avail / pace lead now by at most two
+    // periods; a present writing a time beyond now + 4 periods is the birth moment of a boot-7-style whole-ring
+    // displacement -- this line exists so a future session can catch the writing code path in the act. Throttled
+    // to one line per second (presents keep running while a displacement forms)
+    if (period) {
+        uint64_t worst = pc.target; if (idx >= 0 && idx < 4 && o->avail[idx] > worst) worst = o->avail[idx];
+        if (worst > now + 4 * period) { static uint64_t trace_last; if (now - trace_last >= 1000000000ull) { trace_last = now; LOG("【红】[nvn] 出图写出超前时刻：领先 %llu ms（上限 %llu ms），仅记录", (unsigned long long)((worst - now) / 1000000), (unsigned long long)(4 * period / 1000000)); } }
+    }
     static uint64_t prev_slot; if (prev_slot && period) trow(f, "@display_ms", (slot - prev_slot) / 1e6); prev_slot = slot;   // 屏幕上相邻两帧的显示间隔（掉帧看这个） | display interval between two adjacent frames on screen (this is the one to look at for dropped frames)
     // 实际呈现间隔（窗口模式）：滞后 8 次出图取（呈现回调已到），第 n 次与第 n−1 次之差；−1 = 被丢弃
     // Actual presentation interval (windowed mode): taken 8 presents late (the presented callback has arrived by then), as the difference between the n-th and the (n−1)-th; −1 = discarded
