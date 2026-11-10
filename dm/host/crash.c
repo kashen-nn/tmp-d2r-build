@@ -115,6 +115,31 @@ static void pq_state_dump(void) {
     fprintf(stderr, "[dm] 出图队列：入 %llu / 已取 %llu / 完成 %llu / 在飞 %d\n",
             (unsigned long long)enq, (unsigned long long)taken, (unsigned long long)done, inflight);
 }
+// 取图快照（hle_nvn.c 的只读导出 dm_nvn_acq_state）：弱引用同上——分清主线程是「反复进入取图等待」还是「卡在单次等待里」
+// Acquire snapshot (the read-only export dm_nvn_acq_state in hle_nvn.c): weak reference, same as above -- tells apart "the main thread keeps re-entering the acquire waits" from "parked in one single wait"
+__attribute__((weak)) void dm_nvn_acq_state(uint64_t *acq_wait_ns, uint64_t *pq_wait_ns, uint64_t *acq_calls, uint64_t *frame,
+                                            uint64_t win_avail[4], uint64_t win_ticket[4], uint64_t *win_pace, uint64_t *win_presents,
+                                            int *win_ntex, uint64_t *now_out);
+static void acq_state_dump(void) {
+    if (!dm_nvn_acq_state) return;
+    uint64_t aw, pw, calls, frame, avail[4], ticket[4], pace, presents, now; int ntex;
+    dm_nvn_acq_state(&aw, &pw, &calls, &frame, avail, ticket, &pace, &presents, &ntex, &now);
+    fprintf(stderr, "[dm] 取图快照：节拍等待累计 %llu ns / 出图归还等待累计 %llu ns / 取图调用 %llu 次 / 帧 %llu；主窗口 张数 %d / 已出图 %llu / pace %llu / 快照时刻 %llu / avail [%llu %llu %llu %llu] / ticket [%llu %llu %llu %llu]\n",
+            (unsigned long long)aw, (unsigned long long)pw, (unsigned long long)calls, (unsigned long long)frame,
+            ntex, (unsigned long long)presents, (unsigned long long)pace, (unsigned long long)now,
+            (unsigned long long)avail[0], (unsigned long long)avail[1], (unsigned long long)avail[2], (unsigned long long)avail[3],
+            (unsigned long long)ticket[0], (unsigned long long)ticket[1], (unsigned long long)ticket[2], (unsigned long long)ticket[3]);
+}
+// 显示节拍快照（nvn_mtl.m 的只读导出 mtl_link_state）：弱引用同上
+// Display-link snapshot (the read-only export mtl_link_state in nvn_mtl.m): weak reference, same as above
+__attribute__((weak)) void mtl_link_state(uint64_t *tick_ns, uint64_t *tick_n, int64_t *tick_age_ns, int *owns_layer, int *link_active);
+static void link_state_dump(void) {
+    if (!mtl_link_state) return;
+    uint64_t tns, tn; int64_t age; int owns, active;
+    mtl_link_state(&tns, &tn, &age, &owns, &active);
+    fprintf(stderr, "[dm] 显示节拍：最近拍时刻 %llu / 拍号 %llu / 距今 %lld ns / 持层 %d / 激活 %d\n",
+            (unsigned long long)tns, (unsigned long long)tn, (long long)age, owns, active);
+}
 
 static uint64_t watch_now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -144,12 +169,20 @@ static void *watchdog_main(void *arg) {
         uint64_t last = atomic_load(&g_watch_last_ns), now = watch_now_ns();
         if (last > now) continue;
         // 秒级卡顿（进展停了、还没到判死的阈值）：不退出，把各线程在等什么导一份。撞到「每 2 秒才出一帧」的现场，15 秒阈值抓不到、日志里没有它在等什么。
-        // 进局之后才导；每个进程最多 3 份、两份之间至少隔 10 秒（读取画面、暂停菜单也会停拍，别让它们刷屏）
+        // 进局之后才导；每个进程最多 4 份、两份之间至少隔 10 秒（读取画面、暂停菜单也会停拍，别让它们刷屏）。
+        // 同一次停滞在首份约 10 秒后可再导一份（每停滞至多两份，上限 4 = 两次停滞各两份）：boot-6 的冻结里单份现场分不开
+        // 「客机在切换处理里反复进入有界取图等待」与「某个绝对时刻被留在未来、单次死睡」——两份作差分才行：
+        // 取图调用次数 / 节拍拍号涨 = 前者；都冻住、再看 avail 减快照时刻 = 后者。进展一恢复（last 变了）本轮计数重置
         // Second-scale stall (progress has stopped but has not yet reached the kill threshold): do not exit, dump what each thread is waiting on. When hitting a case of "only one frame every 2 seconds", the 15-second threshold cannot catch it and the log has nothing on what it is waiting for.
-        // Dump only after entering a run; at most 3 dumps per process, at least 10 seconds between two dumps (the loading screen and the pause menu also stop ticks, do not let them flood the log)
-        { static int dumps; static uint64_t last_dump, dumped_for;
+        // Dump only after entering a run; at most 4 dumps per process, at least 10 seconds between two dumps (the loading screen and the pause menu also stop ticks, do not let them flood the log).
+        // The same stall may be dumped once more about 10 s after its first dump (at most two per stall; the cap of 4 = two stalls with two each): a single dump of the boot-6 freeze could not tell
+        // "the guest keeps re-entering bounded acquire waits inside its transition handling" from "one absolute time was left in the future and a single wait sleeps forever" -- the difference between the two can:
+        // a rising acquire count / link tick number means the former; both frozen, with avail minus the snapshot time naming the latter. As soon as progress resumes (last moves on) the per-stall count resets
+        { static int dumps, ep_dumps; static uint64_t last_dump, dumped_for;
           if (g_watch_dump_ms && !atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0 && now - last >= (uint64_t)g_watch_dump_ms * 1000000ull && (!g_watch_stall || now - last < (uint64_t)g_watch_stall * 1000000000ull)
-              && dumps < 3 && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; crash_dump_now("进展停滞达导出阈值（只导出，不退出）"); } }
+              && dumps < 4 && (!last_dump || now - last_dump >= 10000000000ull)) {
+              if (dumped_for != last) { dumped_for = last; ep_dumps = 0; }   // 新的停滞：本轮计数重置 | A new stall: reset this episode's count
+              if (ep_dumps < 2) { ep_dumps++; dumps++; last_dump = now; crash_dump_now(ep_dumps == 2 ? "同一停滞二次导出（与上一份作差分，只导出，不退出）" : "进展停滞达导出阈值（只导出，不退出）"); } } }
         if (g_watch_stall && now - last >= (uint64_t)g_watch_stall * 1000000000ull) {
             uint64_t sec = (now - last) / 1000000000ull;
             int idx = atomic_load(&g_watch_stage_idx);
@@ -158,6 +191,8 @@ static void *watchdog_main(void *arg) {
             if (g_dump_hook) g_dump_hook();
             if (g_wait_dump) g_wait_dump();   // 图形侧所有阻塞等待点的状态（nvn_mtl.m 初始化时注册） | State of all blocking wait points on the graphics side (registered when nvn_mtl.m initializes)
             pq_state_dump();   // 出图队列计数（入 / 已取 / 完成 / 在飞）：分清卡在未取走还是已取走等完成 | Present-queue counters (enqueued / taken / done / in flight): tells apart "not taken yet" from "taken, awaiting completion"
+            acq_state_dump();   // 取图快照（等待累计 / 调用次数 / 主窗口 avail 原值）：与停滞导出打的是同一组 | Acquire snapshot (accumulated waits / call count / main window's raw avail): the same set the stall dumps print
+            link_state_dump();   // 显示节拍快照（最近拍时刻 / 距今 / 持层 / 激活） | Display-link snapshot (last tick time / age / owns layer / active)
 #if TARGET_OS_OSX
             { const char *d = getenv("DM_WATCH_SAMPLE");   // Mac 诊断：卡住时对自己采样 1 秒，线程栈写到该路径 | Mac diagnostics: when stuck, sample itself for 1 second and write the thread stacks to this path
               if (d) { char c[1200]; snprintf(c, sizeof c, "/usr/bin/sample %d 1 -f '%s' >/dev/null 2>&1", (int)getpid(), d); if (system(c)) LOG("看门狗：采样失败"); else LOG("看门狗：线程栈已写 %s", d); } }
@@ -225,7 +260,7 @@ void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
-void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); pq_state_dump(); }
+void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); pq_state_dump(); acq_state_dump(); link_state_dump(); }
 // 第二段（符号化与线程现场）的看门：它要 stdio、dladdr、分配内存，可能卡在崩溃线程自己持着的锁上；3 秒没走完就由这个闹钟直接退出进程。
 // 要赶在系统判「无响应」（5 秒）之前：卡住的分配器锁会连界面线程一起拖住，与其让玩家看到无响应框，不如带着第一段的现场退出
 // Watchdog for the second part (symbols and the thread dump): it needs stdio, dladdr and memory allocation, and may block on a lock the crashing thread
@@ -305,11 +340,11 @@ void crash_install(void) {
     // Both "kill" watchdogs are turned on only when a test explicitly sets DM_WATCH / DM_WATCH_STALL: the product (the player launches from the desktop, no environment variables) turns on neither.
     // Found by reading the code: iOS main.m did setenv DM_WATCH=30 by default → the player's launch was killed by SIGALRM at 30 s; the no-progress watchdog defaulted to 15 s → the pause menu (ticks stopped) was killed at 15 s
     // 但「只导出、不退出」的停滞记录产品缺省开（阈值 3 秒，DM_WATCH_DUMP 改毫秒、0 关）：判死当年的顾虑是误杀，
-    // 导出不退出、不发信号、不碰时序，误报的代价只是日志里多一份现场（且有 3 份/进程、间隔 10 秒的既有上限）。
+    // 导出不退出、不发信号、不碰时序，误报的代价只是日志里多一份现场（且有 4 份/进程、同停滞至多两份、间隔 10 秒的既有上限）。
     // 不开它的代价已实测：3.1 两局换区卡死（boot-2 / boot-3）客机停拍停帧、宿主全活，日志里没有任何线程等待点。
     // The dump-only stall recorder, however, is on by default in the product (3 s threshold; DM_WATCH_DUMP overrides in ms, 0 turns it off):
     // the historical concern was false kills, while a dump never exits, signals or touches timing -- a false positive costs one extra state
-    // dump in the log (still bounded by the existing 3-per-process, 10 s-apart caps). Leaving it off has a measured cost instead: in both
+    // dump in the log (still bounded by the existing 4-per-process, at most two of one stall, 10 s-apart caps). Leaving it off has a measured cost instead: in both
     // 3.1 zone-transition freezes (boot-2 / boot-3) the guest stopped ticking and presenting with the host fully alive, and the logs held
     // no thread wait point at all.
     const char *watch = getenv("DM_WATCH"), *stall = getenv("DM_WATCH_STALL"), *dump = getenv("DM_WATCH_DUMP");

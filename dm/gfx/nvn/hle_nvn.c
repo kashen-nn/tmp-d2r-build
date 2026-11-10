@@ -1143,10 +1143,13 @@ extern uint32_t mtl_present_qos(void);
 static uint64_t g_frame;
 static uint64_t g_pa_wait;   // 本帧取图里节拍等待（自适应出图档用） | pacing wait inside acquire this frame (for the adaptive present tier)
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
+static uint64_t g_acq_calls;   // 取图调用总次数（看门狗取证：同停滞两份导出作差分，分「反复进入取图」与「单次死睡」） | Total acquire calls (watchdog forensics: differenced between two dumps of one stall, to tell "re-entering acquire again and again" from "parked in one single wait")
+static win_t *g_acq_win;   // 最近一次取图的窗口（看门狗取证打它的 avail / pace 原值） | Window of the most recent acquire (the watchdog dump prints its raw avail / pace values)
 uint64_t dm_nvn_frame_count(void) { return g_frame; }
 extern uint64_t g_t0_ns;   // 宿主进程起点（main.c；UIMSG 时间戳同基） | Host process start point (main.c; same base as the UIMSG timestamps)
 NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsync *s, int *idx) {
     win_t *o = (win_t *)w;
+    g_acq_calls++; g_acq_win = o;   // 看门狗取证记账：只写计数与指针，没有任何判定读它们 | Watchdog forensics bookkeeping: writes only a counter and a pointer; no decision ever reads them
     *idx = o->ntex ? o->next++ % o->ntex : 0;
     // 垂直同步阻塞在这里（真机 NVN：交换链里的贴图都在等显示时，等下一张被释放），不在出图里——游戏常持锁调出图
     // Vsync blocks here (real-device NVN: when all textures in the swapchain are waiting for display, wait for the next one to be released), not in present -- the game often calls present while holding a lock
@@ -1171,6 +1174,39 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
     if (tk) { uint64_t w0 = now_ns(), rt = x_present_ticket(tk); if (rt) mtl_present_wait(rt); g_pq_wait_ns += now_ns() - w0; }   // tk 是翻译队列的出图任务号 | tk is the translation queue's present job number
     if (s) { ((sync_t *)s)->fenced = 1; ((sync_t *)s)->fence = x_fence(); g_acq_sync = s; }   // 交换链贴图在此前的提交完成后可用 | The swapchain texture becomes available once the commits before this point have completed
     return NVN_WINDOW_ACQUIRE_TEXTURE_RESULT_SUCCESS;
+}
+// 看门狗导出现场用（crash.c 弱引用调用）：取图路径的只读快照——两种等待累计、取图调用次数、帧号，及最近取图窗口的
+// avail / pace / ticket 原值与快照时刻（同为 now_ns 时钟基；产品未开确定性时钟时 avail / pace 也按此基写入）。
+// 与 mtl_pq_state 同惯例不持锁读：导出发生在停滞现场，等待者都放锁睡着，数值至多差一拍、只作诊断。
+// 判读（同一次停滞的两份导出作差分）：取图调用次数在涨 = 客机在反复进入取图（等待都单次有界、靠重复进入叠成永停）；
+// 次数冻住而主线程停着 = 卡在单次等待里，此时看 avail[i] − 快照时刻：某张比两个周期还远地在未来，就是被留在未来的那个绝对时刻；
+// 两个累计同理：涨的是哪一段等待、冻的是哪一段等待，一并可分（注意两累计每帧出图时清零，停滞中无人出图、不会被清）
+// For the watchdog's state dump (called from crash.c through a weak reference): a read-only snapshot of the acquire path -- the two
+// accumulated waits, the acquire call count, the frame number, and the raw avail / pace / ticket of the most recently acquired window
+// plus the snapshot time (all on the now_ns clock base; with the deterministic clock off, as in the product, avail / pace are written
+// on that base too). Read without locks, the same convention as mtl_pq_state: the dump happens at a stall where the waiters sleep with
+// their locks released, so the values are at worst one beat stale and diagnostic only.
+// Reading (difference the two dumps of one stall): a rising acquire count = the guest keeps re-entering acquire (each wait is bounded
+// on its own; only repetition stacks them into a permanent stop); a frozen count with the main thread parked = one single wait, and
+// avail[i] - snapshot time then names it: a texture sitting more than two periods in the future is the absolute time left behind.
+// The two accumulators read the same way (which wait grows, which is frozen); both are reset at each present, and nobody presents
+// during a stall, so a stall never clears them mid-way
+void dm_nvn_acq_state(uint64_t *acq_wait_ns, uint64_t *pq_wait_ns, uint64_t *acq_calls, uint64_t *frame,
+                      uint64_t win_avail[4], uint64_t win_ticket[4], uint64_t *win_pace, uint64_t *win_presents,
+                      int *win_ntex, uint64_t *now_out) {
+    if (acq_wait_ns) *acq_wait_ns = g_acq_wait_ns;
+    if (pq_wait_ns) *pq_wait_ns = g_pq_wait_ns;
+    if (acq_calls) *acq_calls = g_acq_calls;
+    if (frame) *frame = g_frame;
+    win_t *o = g_acq_win;
+    for (int i = 0; i < 4; i++) {
+        if (win_avail) win_avail[i] = o ? o->avail[i] : 0;
+        if (win_ticket) win_ticket[i] = o ? o->ticket[i] : 0;
+    }
+    if (win_pace) *win_pace = o ? o->pace : 0;
+    if (win_presents) *win_presents = o ? o->presents : 0;
+    if (win_ntex) *win_ntex = o ? o->ntex : -1;
+    if (now_out) *now_out = now_ns();
 }
 
 // 帧边界：每次出图打印 / 落盘本帧各 NVN 函数调用次数

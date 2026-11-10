@@ -6859,6 +6859,24 @@ void mtl_pq_state(uint64_t *enq, uint64_t *taken, uint64_t *done, int *inflight)
     if (done) *done = g_pq_done;
     if (inflight) *inflight = g_pq_inflight;
 }
+// 看门狗导出现场用（crash.c 弱引用调用）：显示节拍的只读快照——最近一拍的时刻（now_ns 时钟基）与拍号、距今时长
+// （从未有过拍 = −1）、节拍是否正持有图层、节拍是否激活。与 mtl_pq_state 同惯例不持锁读：节拍计数原子读，
+// 图层所有权在 g_pq_mu 下写、导出时至多差一拍，只作诊断。两份导出作差分：拍号涨 = 节拍还活着（客机侧在反复进出），
+// 拍号与时刻都冻住、距今时长远超两个周期 = 节拍本身停了，取图里的节拍等待只能靠超时兜底往返
+// For the watchdog's state dump (called from crash.c through a weak reference): a read-only snapshot of the display link -- the last
+// tick's time (on the now_ns clock base) and number, its age (-1 = never ticked), whether the link currently owns the layer, and
+// whether it is active. Read without locks, the same convention as mtl_pq_state: atomic loads for the tick counters; layer ownership
+// is written under g_pq_mu and at worst one beat stale at dump time, diagnostic only. Differencing two dumps: a rising tick number =
+// the link is alive (the guest side is cycling); tick number and time both frozen with an age far beyond two periods = the link itself
+// has stopped, and the tick wait inside acquire can only ever return through its timeout
+void mtl_link_state(uint64_t *tick_ns, uint64_t *tick_n, int64_t *tick_age_ns, int *owns_layer, int *link_active) {
+    uint64_t t = __atomic_load_n(&g_link_tick_ns, __ATOMIC_RELAXED);
+    if (tick_ns) *tick_ns = t;
+    if (tick_n) *tick_n = __atomic_load_n(&g_link_tick_n, __ATOMIC_RELAXED);
+    if (tick_age_ns) *tick_age_ns = t ? (int64_t)(now_ns() - t) : -1;
+    if (owns_layer) *owns_layer = g_link_owns_layer;
+    if (link_active) *link_active = mtl_link_active();
+}
 // 看门狗（无进展）时调用：把图形侧所有阻塞等待点的状态写进日志——谁在等谁一眼可见（换 Metal 4 提交模型后出现过一次「跑到 900 帧后停住、无红行」）
 // Called by the watchdog (no progress): writes the state of all blocking wait points on the graphics side to the log -- who is waiting for whom is visible at a glance (after switching to the Metal 4 submit model there was once a case of "ran to 900 frames then stopped, no failure line")
 void mtl_wait_state_dump(void) {
