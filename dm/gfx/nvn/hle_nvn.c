@@ -1426,6 +1426,7 @@ static void present_cfg(const win_t *o) {
 // whole pipeline's bottleneck: max(mean game-thread CPU per frame, actual translation-thread CPU per frame, GPU time per frame).
 // Step down at once when the bottleneck exceeds this tier's period by 3%; step up only after 90 consecutive frames below 88% of the faster tier's period, to avoid flapping.
 __attribute__((weak)) uint64_t dm_present_late_count(void) { return 0; } __attribute__((weak)) double xbg_recent_gpu_ms(void) { return -1; }   // 空的弱定义（不是弱声明）：苹果链接器要求弱引用链接时有定义；Vulkan 后端 / 鸿蒙平台层给强定义 | empty weak definitions (not declarations): Apple's linker needs a weak reference to resolve; the Vulkan backend / HarmonyOS platform give the strong ones
+extern int (*g_nvn_loadscreen_up)(void);   // 定义在本文件 nvnQueuePresentTexture 之前（宿主登记的读取画面状态）；这里先声明，给 pace_adapt_tick 的读取画面钉档用 | Defined further below, before nvnQueuePresentTexture (host-registered loading-screen state); declared here for the loading-screen pin in pace_adapt_tick
 static void pace_adapt_tick(double screen_hz) {
     if (!pace_adapt_enabled() || screen_hz <= 0) return;
     // 游戏侧取本线程 CPU 时间（不含任何等待）：墙钟减节拍等待会把下游等待（合成器按时放帧 → 翻译线程等交换链 → 游戏等翻译）算进去，形成越降越慢的正反馈
@@ -1452,6 +1453,24 @@ static void pace_adapt_tick(double screen_hz) {
     // the faster tier, skip 20 frames while clocks ramp, then judge 60 frames; >= 4 misses reverts and doubles the next probe interval (from 3 s, at most 60 s). Misses come from the
     // platform present counter (dm_present_late_count); without it, a game frame interval 25% over the period counts as a miss.
     static unsigned wn, skip, misses_local; static int probing; static uint64_t late0, stable_since, backoff = 3000000000ull;
+    // 读取画面钉档（3.1 回归修复）：换区加载时产帧天然成串不规则，窗口账会跨着加载取数（加载里的合并丢弃全记进 misses），
+    // 加载结束瞬间可能按被污染的账判一次档；而自适应接通（3.1）之前，加载全程是固定档、从不卡死，两次卡死又都落在换区点上。
+    // 故读取画面开着、及关后 5 秒内不判升降档：档位值不动，窗口基线每拍对齐当下，恢复判档后的第一个窗从干净基线起算。
+    // 战斗中的判档行为一字不变。读取画面状态就是进局预热闸用的同一个宿主信号（g_nvn_loadscreen_up，未登记 = 不钉）。
+    // Loading-screen pin (3.1 regression fix): while a zone loads, frame production is bursty by nature and the judging window would span
+    // the load (every merge-drop during the load lands in the miss count), so the first verdict right at load exit can be based on polluted
+    // accounting. Before the adaptive tier went live (3.1), loads ran at a fixed tier and never froze, and both 3.1 freezes sit exactly on
+    // zone transitions. So while the loading screen is up, and for 5 s after it closes, do not judge step up/down: the tier value stays,
+    // the window baselines track the present each tick, and the first window after judging resumes starts from a clean baseline.
+    // In-combat judging is unchanged. The loading-screen state is the same host signal the entry warm-up gate uses (unset = no pin).
+    { static int pinning; static uint64_t pin_until;
+      if (g_nvn_loadscreen_up && g_nvn_loadscreen_up()) pin_until = now + 5000000000ull;
+      if (pin_until && now < pin_until) {
+          if (!pinning) { pinning = 1; LOG("[nvn] 出图档：读取画面期间钉住 %.1f FPS（不判升降档，画面关后 5 秒恢复判档）", screen_hz / g_pa_k); }
+          late0 = dm_present_late_count ? dm_present_late_count() : 0; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now;
+          return;
+      }
+      if (pinning) { pinning = 0; LOG("[nvn] 出图档：读取画面结束，恢复自适应判档（当前 %.1f FPS）", screen_hz / g_pa_k); } }
     uint64_t lc = dm_present_late_count ? dm_present_late_count() : 0;
     if (!dm_present_late_count && iv > per * 1.25) misses_local++;
     if (!stable_since) { stable_since = now; late0 = lc; }
