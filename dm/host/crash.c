@@ -105,6 +105,16 @@ static unsigned g_watch_stall;
 static unsigned g_watch_dump_ms;   // 停滞导出的阈值（毫秒，0 = 不导）：与判死（g_watch_stall）分开——产品缺省只开导出、不开判死 | Stall-dump threshold in ms (0 = no dumps): separate from the kill threshold (g_watch_stall) -- the product default enables dumps only, never the kill
 static void (*g_dump_hook)(void);
 static void (*g_wait_dump)(void);
+// 出图队列计数（nvn_mtl.m 的只读导出 mtl_pq_state）：弱引用——图形单测只链本文件时符号不存在，跳过这一行不影响链接
+// Present-queue counters (the read-only export mtl_pq_state in nvn_mtl.m): a weak reference -- when a graphics unit test links only this file the symbol is absent and this line is skipped without affecting the link
+__attribute__((weak)) void mtl_pq_state(uint64_t *enq, uint64_t *taken, uint64_t *done, int *inflight);
+static void pq_state_dump(void) {
+    if (!mtl_pq_state) return;
+    uint64_t enq, taken, done; int inflight;
+    mtl_pq_state(&enq, &taken, &done, &inflight);
+    fprintf(stderr, "[dm] 出图队列：入 %llu / 已取 %llu / 完成 %llu / 在飞 %d\n",
+            (unsigned long long)enq, (unsigned long long)taken, (unsigned long long)done, inflight);
+}
 
 static uint64_t watch_now_ns(void) {
     struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -147,6 +157,7 @@ static void *watchdog_main(void *arg) {
                 atomic_load(&g_watch_tick), g_watch_stage[idx]);
             if (g_dump_hook) g_dump_hook();
             if (g_wait_dump) g_wait_dump();   // 图形侧所有阻塞等待点的状态（nvn_mtl.m 初始化时注册） | State of all blocking wait points on the graphics side (registered when nvn_mtl.m initializes)
+            pq_state_dump();   // 出图队列计数（入 / 已取 / 完成 / 在飞）：分清卡在未取走还是已取走等完成 | Present-queue counters (enqueued / taken / done / in flight): tells apart "not taken yet" from "taken, awaiting completion"
 #if TARGET_OS_OSX
             { const char *d = getenv("DM_WATCH_SAMPLE");   // Mac 诊断：卡住时对自己采样 1 秒，线程栈写到该路径 | Mac diagnostics: when stuck, sample itself for 1 second and write the thread stacks to this path
               if (d) { char c[1200]; snprintf(c, sizeof c, "/usr/bin/sample %d 1 -f '%s' >/dev/null 2>&1", (int)getpid(), d); if (system(c)) LOG("看门狗：采样失败"); else LOG("看门狗：线程栈已写 %s", d); } }
@@ -214,7 +225,7 @@ void crash_set_dump_hook(void (*fn)(void)) { g_dump_hook = fn; }
 void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
-void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); pq_state_dump(); }
 // 第二段（符号化与线程现场）的看门：它要 stdio、dladdr、分配内存，可能卡在崩溃线程自己持着的锁上；3 秒没走完就由这个闹钟直接退出进程。
 // 要赶在系统判「无响应」（5 秒）之前：卡住的分配器锁会连界面线程一起拖住，与其让玩家看到无响应框，不如带着第一段的现场退出
 // Watchdog for the second part (symbols and the thread dump): it needs stdio, dladdr and memory allocation, and may block on a lock the crashing thread

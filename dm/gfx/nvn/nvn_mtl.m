@@ -6847,6 +6847,18 @@ id<CAMetalDrawable> mtl_present_take_prefetched(void) { return g_prefetched_draw
 #include "rt_range_check.inc"
 #endif
 
+// 看门狗导出现场用（crash.c 弱引用调用）：出图队列四个计数器的只读快照——入队 / 已取 / 完成 / 在飞，
+// 一眼能分清等待者卡在哪一段（未取走 / 已取走等完成 / 在飞未清）。与 mtl_wait_state_dump 同惯例不持锁读：
+// 导出发生在停滞现场，等待者都放锁睡在条件变量上，计数至多差一拍、只作诊断
+// For the watchdog's state dump (called from crash.c through a weak reference): a read-only snapshot of the four present-queue counters -- enqueued / taken / done / in flight,
+// so which segment a waiter is stuck in is visible at a glance (not taken yet / taken and awaiting completion / in flight not drained). Read without the lock, the same convention as mtl_wait_state_dump:
+// the dump happens at a stall where every waiter sleeps on the condition variable with the lock released, and the counts are at worst one beat stale and diagnostic only
+void mtl_pq_state(uint64_t *enq, uint64_t *taken, uint64_t *done, int *inflight) {
+    if (enq) *enq = g_pq_in;
+    if (taken) *taken = g_pq_read;
+    if (done) *done = g_pq_done;
+    if (inflight) *inflight = g_pq_inflight;
+}
 // 看门狗（无进展）时调用：把图形侧所有阻塞等待点的状态写进日志——谁在等谁一眼可见（换 Metal 4 提交模型后出现过一次「跑到 900 帧后停住、无红行」）
 // Called by the watchdog (no progress): writes the state of all blocking wait points on the graphics side to the log -- who is waiting for whom is visible at a glance (after switching to the Metal 4 submit model there was once a case of "ran to 900 frames then stopped, no failure line")
 void mtl_wait_state_dump(void) {
