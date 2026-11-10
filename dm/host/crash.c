@@ -102,6 +102,7 @@ static _Atomic int g_watch_pregame = 1;
 static _Atomic int g_watch_stage_idx;
 static char g_watch_stage[2][256] = {"启动", "启动"};
 static unsigned g_watch_stall;
+static unsigned g_watch_dump_ms;   // 停滞导出的阈值（毫秒，0 = 不导）：与判死（g_watch_stall）分开——产品缺省只开导出、不开判死 | Stall-dump threshold in ms (0 = no dumps): separate from the kill threshold (g_watch_stall) -- the product default enables dumps only, never the kill
 static void (*g_dump_hook)(void);
 static void (*g_wait_dump)(void);
 
@@ -132,13 +133,13 @@ static void *watchdog_main(void *arg) {
         // which is misjudged on the spot as a hang and exits (accept inv_drag_out, local load 11, the watchdog thread was switched out between the two reads). Reading this way gives last ≤ now; and if the clock ever wraps around it is not judged either
         uint64_t last = atomic_load(&g_watch_last_ns), now = watch_now_ns();
         if (last > now) continue;
-        // 秒级卡顿（进展停了 1 秒以上、还没到判死的阈值）：不退出，把各线程在等什么导一份。撞到「每 2 秒才出一帧」的现场，15 秒阈值抓不到、日志里没有它在等什么。
+        // 秒级卡顿（进展停了、还没到判死的阈值）：不退出，把各线程在等什么导一份。撞到「每 2 秒才出一帧」的现场，15 秒阈值抓不到、日志里没有它在等什么。
         // 进局之后才导；每个进程最多 3 份、两份之间至少隔 10 秒（读取画面、暂停菜单也会停拍，别让它们刷屏）
-        // Second-scale stall (progress has stopped for more than 1 second but has not yet reached the kill threshold): do not exit, dump what each thread is waiting on. When hitting a case of "only one frame every 2 seconds", the 15-second threshold cannot catch it and the log has nothing on what it is waiting for.
+        // Second-scale stall (progress has stopped but has not yet reached the kill threshold): do not exit, dump what each thread is waiting on. When hitting a case of "only one frame every 2 seconds", the 15-second threshold cannot catch it and the log has nothing on what it is waiting for.
         // Dump only after entering a run; at most 3 dumps per process, at least 10 seconds between two dumps (the loading screen and the pause menu also stop ticks, do not let them flood the log)
         { static int dumps; static uint64_t last_dump, dumped_for;
-          if (g_watch_stall && !atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0 && now - last >= 1000000000ull && now - last < (uint64_t)g_watch_stall * 1000000000ull
-              && dumps < 3 && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; crash_dump_now("进展停了 1 秒以上"); } }
+          if (g_watch_dump_ms && !atomic_load(&g_watch_pregame) && atomic_load(&g_watch_tick) > 0 && now - last >= (uint64_t)g_watch_dump_ms * 1000000ull && (!g_watch_stall || now - last < (uint64_t)g_watch_stall * 1000000000ull)
+              && dumps < 3 && dumped_for != last && (!last_dump || now - last_dump >= 10000000000ull)) { dumps++; last_dump = now; dumped_for = last; crash_dump_now("进展停滞达导出阈值（只导出，不退出）"); } }
         if (g_watch_stall && now - last >= (uint64_t)g_watch_stall * 1000000000ull) {
             uint64_t sec = (now - last) / 1000000000ull;
             int idx = atomic_load(&g_watch_stage_idx);
@@ -288,14 +289,25 @@ void crash_install(void) {
     crash_thread_init();
     struct sigaction sa = {.sa_sigaction = on_crash, .sa_flags = SA_SIGINFO | CRASH_SA_ONSTACK};
     sigaction(SIGALRM, &sa, 0);
-    // 两种看门狗都只在测试显式设了 DM_WATCH / DM_WATCH_STALL 时开：产品（玩家从桌面启动，无环境变量）一个不开。
+    // 两个「判死」看门狗都只在测试显式设了 DM_WATCH / DM_WATCH_STALL 时开：产品（玩家从桌面启动，无环境变量）一个不开。
     // 读代码查到：iOS main.m 缺省 setenv DM_WATCH=30 → 玩家启动 30 s 被 SIGALRM 杀；无进展看门狗缺省 15 s → 暂停菜单（拍停）15 s 被杀
-    // Both watchdogs are turned on only when a test explicitly sets DM_WATCH / DM_WATCH_STALL: the product (the player launches from the desktop, no environment variables) turns on neither.
+    // Both "kill" watchdogs are turned on only when a test explicitly sets DM_WATCH / DM_WATCH_STALL: the product (the player launches from the desktop, no environment variables) turns on neither.
     // Found by reading the code: iOS main.m did setenv DM_WATCH=30 by default → the player's launch was killed by SIGALRM at 30 s; the no-progress watchdog defaulted to 15 s → the pause menu (ticks stopped) was killed at 15 s
-    const char *watch = getenv("DM_WATCH"), *stall = getenv("DM_WATCH_STALL");
+    // 但「只导出、不退出」的停滞记录产品缺省开（阈值 3 秒，DM_WATCH_DUMP 改毫秒、0 关）：判死当年的顾虑是误杀，
+    // 导出不退出、不发信号、不碰时序，误报的代价只是日志里多一份现场（且有 3 份/进程、间隔 10 秒的既有上限）。
+    // 不开它的代价已实测：3.1 两局换区卡死（boot-2 / boot-3）客机停拍停帧、宿主全活，日志里没有任何线程等待点。
+    // The dump-only stall recorder, however, is on by default in the product (3 s threshold; DM_WATCH_DUMP overrides in ms, 0 turns it off):
+    // the historical concern was false kills, while a dump never exits, signals or touches timing -- a false positive costs one extra state
+    // dump in the log (still bounded by the existing 3-per-process, 10 s-apart caps). Leaving it off has a measured cost instead: in both
+    // 3.1 zone-transition freezes (boot-2 / boot-3) the guest stopped ticking and presenting with the host fully alive, and the logs held
+    // no thread wait point at all.
+    const char *watch = getenv("DM_WATCH"), *stall = getenv("DM_WATCH_STALL"), *dump = getenv("DM_WATCH_DUMP");
     if (watch) alarm(atoi(watch));
-    if (watch || stall) {
-        g_watch_stall = stall && atoi(stall) > 0 ? (unsigned)atoi(stall) : 15;
+    if (watch || stall) g_watch_dump_ms = 1000;   // 测试口径：停 1 秒导一份（判死秒数另按 stall / 缺省 15） | Test behaviour: dump after 1 s (the kill seconds come from stall / the default 15)
+    else if (dump) g_watch_dump_ms = (unsigned)atoi(dump);
+    else g_watch_dump_ms = 3000;
+    if (watch || stall || g_watch_dump_ms) {
+        g_watch_stall = stall && atoi(stall) > 0 ? (unsigned)atoi(stall) : (stall || watch ? 15 : 0);   // 产品模式 0 = 永不判死 | 0 in product mode = never kills
         atomic_store(&g_watch_last_ns, watch_now_ns());
         pthread_t th; if (pthread_create(&th, NULL, watchdog_main, NULL)) die("看门狗线程");
         pthread_detach(th);
