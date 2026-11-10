@@ -1984,6 +1984,7 @@ static void shotui_install(void) {
     uimsg_subscribe(loadscreen_on_uimsg);
     { extern uint32_t (*dm_thread_tick_fn)(void); dm_thread_tick_fn = dm_cur_tick; }   // 线程建 / 退记拍号（hle_thread.c 现场导出用） | Thread creation / exit records the tick number (used by the hle_thread.c state dump)
     { extern int (*g_nvn_loadscreen_up)(void); g_nvn_loadscreen_up = dm_loadscreen_up; }   // 出图处「进局读取画面等管线预热」用 | Used at present for "the run-entry loading screen waits for pipeline warm-up"
+    { extern int (*g_nvn_panel_up)(void); int dm_hud_stack_any(void); g_nvn_panel_up = dm_hud_stack_any; }   // 出图档「状态切换边界」钉档的面板源：面板开合栈（dm_cursor.c）的缓存读数 | Panel source for the present tier's state-transition pin: the cached reading of the panel open/close stack (dm_cursor.c)
     const char *e = getenv("DM_NVN_SHOT_UI"); if (!e) return;
     char buf[4096]; strlcpy(buf, e, sizeof buf);
     for (char *sv, *tok = strtok_r(buf, ",", &sv); tok; tok = strtok_r(NULL, ",", &sv)) {

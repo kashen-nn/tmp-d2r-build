@@ -1426,7 +1426,8 @@ static void present_cfg(const win_t *o) {
 // whole pipeline's bottleneck: max(mean game-thread CPU per frame, actual translation-thread CPU per frame, GPU time per frame).
 // Step down at once when the bottleneck exceeds this tier's period by 3%; step up only after 90 consecutive frames below 88% of the faster tier's period, to avoid flapping.
 __attribute__((weak)) uint64_t dm_present_late_count(void) { return 0; } __attribute__((weak)) double xbg_recent_gpu_ms(void) { return -1; }   // 空的弱定义（不是弱声明）：苹果链接器要求弱引用链接时有定义；Vulkan 后端 / 鸿蒙平台层给强定义 | empty weak definitions (not declarations): Apple's linker needs a weak reference to resolve; the Vulkan backend / HarmonyOS platform give the strong ones
-extern int (*g_nvn_loadscreen_up)(void);   // 定义在本文件 nvnQueuePresentTexture 之前（宿主登记的读取画面状态）；这里先声明，给 pace_adapt_tick 的读取画面钉档用 | Defined further below, before nvnQueuePresentTexture (host-registered loading-screen state); declared here for the loading-screen pin in pace_adapt_tick
+extern int (*g_nvn_loadscreen_up)(void);   // 定义在本文件 nvnQueuePresentTexture 之前（宿主登记的读取画面状态）；这里先声明，给 pace_adapt_tick 的状态切换钉档用 | Defined further below, before nvnQueuePresentTexture (host-registered loading-screen state); declared here for the state-transition pin in pace_adapt_tick
+extern int (*g_nvn_panel_up)(void);   // 定义在本文件 nvnQueuePresentTexture 之前（宿主登记的面板开合栈读数）；同上 | Defined further below, before nvnQueuePresentTexture (host-registered panel-stack reading); same use as above
 static void pace_adapt_tick(double screen_hz) {
     if (!pace_adapt_enabled() || screen_hz <= 0) return;
     // 游戏侧取本线程 CPU 时间（不含任何等待）：墙钟减节拍等待会把下游等待（合成器按时放帧 → 翻译线程等交换链 → 游戏等翻译）算进去，形成越降越慢的正反馈
@@ -1453,24 +1454,45 @@ static void pace_adapt_tick(double screen_hz) {
     // the faster tier, skip 20 frames while clocks ramp, then judge 60 frames; >= 4 misses reverts and doubles the next probe interval (from 3 s, at most 60 s). Misses come from the
     // platform present counter (dm_present_late_count); without it, a game frame interval 25% over the period counts as a miss.
     static unsigned wn, skip, misses_local; static int probing; static uint64_t late0, stable_since, backoff = 3000000000ull;
-    // 读取画面钉档（3.1 回归修复）：换区加载时产帧天然成串不规则，窗口账会跨着加载取数（加载里的合并丢弃全记进 misses），
-    // 加载结束瞬间可能按被污染的账判一次档；而自适应接通（3.1）之前，加载全程是固定档、从不卡死，两次卡死又都落在换区点上。
-    // 故读取画面开着、及关后 5 秒内不判升降档：档位值不动，窗口基线每拍对齐当下，恢复判档后的第一个窗从干净基线起算。
-    // 战斗中的判档行为一字不变。读取画面状态就是进局预热闸用的同一个宿主信号（g_nvn_loadscreen_up，未登记 = 不钉）。
-    // Loading-screen pin (3.1 regression fix): while a zone loads, frame production is bursty by nature and the judging window would span
-    // the load (every merge-drop during the load lands in the miss count), so the first verdict right at load exit can be based on polluted
-    // accounting. Before the adaptive tier went live (3.1), loads ran at a fixed tier and never froze, and both 3.1 freezes sit exactly on
-    // zone transitions. So while the loading screen is up, and for 5 s after it closes, do not judge step up/down: the tier value stays,
-    // the window baselines track the present each tick, and the first window after judging resumes starts from a clean baseline.
-    // In-combat judging is unchanged. The loading-screen state is the same host signal the entry warm-up gate uses (unset = no pin).
-    { static int pinning; static uint64_t pin_until;
-      if (g_nvn_loadscreen_up && g_nvn_loadscreen_up()) pin_until = now + 5000000000ull;
+    // 状态切换边界钉档（3.1 回归修复；窗口由「读取画面」扩到全部状态切换边界）：三局卡死都落在客机状态切换的边界上——
+    // boot-2 在加载完成侧、boot-3 在加载未完成侧、boot-4 在城镇里关技能树/暂停面板后约 2 秒（距上次读取画面约 60 秒、且那次加载
+    // 正常完成）；稳定战斗与稳定停留从不冻。切换期间产帧天然成串不规则，判档窗口会跨着切换取数（合并丢弃全记进 misses），
+    // 切换结束瞬间可能按被污染的账判一次档；而自适应接通（3.1）之前这类时刻全程固定档、从不卡死。故任一受监测源在场期间
+    // 不判升降档。触发源两个：读取画面（g_nvn_loadscreen_up，与进局预热闸同一信号）＋面板（g_nvn_panel_up，宿主面板开合栈
+    // 的缓存读数：非常驻面板开着；只开着 NPC 对话菜单/说话框不算，与栈自身口径一致）。窗口语义：源在场即视为非战斗——
+    // 面板长期开着也只是钉住（档位不动、窗口基线每拍对齐当下、不积累任何待判账目）；最后一个源撤下后才起算 5 秒宽限
+    // （pin_until 是绝对截止时刻、只在源在场时顺延，判档状态机不可能被永久锁死）；恢复判档后的第一个窗从干净基线起算。
+    // 战斗中的判档行为除窗口扩张外一字不变。信号未登记（指针为空）= 该源不存在：面板源缺失时行为与上一版逐字相同
+    //（只钉读取画面）；钉档本身的失效方向是退回固定档（自适应接通前的形态），两条都不比现状更差。
+    // State-transition pin (3.1 regression fix; the window is widened from the loading screen to all guest state-transition
+    // boundaries): all three freezes sit on a state-transition boundary -- boot-2 on the load-completion side, boot-3 on the
+    // load-in-progress side, boot-4 about 2 s after closing the skills-tree / pause panels in town (about 60 s after the last,
+    // normally completed load) -- while stable combat and stable idling never froze. During a transition, frame production is
+    // bursty by nature and the judging window would span it (every merge-drop lands in the miss count), so the first verdict
+    // right at the end of a transition can be based on polluted accounting; before the adaptive tier went live (3.1), these
+    // moments always ran at a fixed tier and never froze. So while any monitored source is up, do not judge step up/down.
+    // Two trigger sources: the loading screen (g_nvn_loadscreen_up, the same signal the entry warm-up gate uses) and panels
+    // (g_nvn_panel_up, the host panel stack's cached reading: a non-resident panel open; the NPC dialog menu / speech box
+    // alone do not count, matching the stack's own convention). Window semantics: a source being up is treated as non-combat --
+    // a panel left open for a long time only holds the pin (tier stays, window baselines track the present every tick, no
+    // pending accounting accumulates); the 5 s grace starts only when the last source goes down (pin_until is an absolute
+    // deadline, extended only while a source is up, so the judging state machine can never latch forever); the first window
+    // after judging resumes starts from a clean baseline. In-combat judging is unchanged apart from the wider window.
+    // An unregistered signal (null pointer) means that source does not exist: without the panel source the behavior is
+    // literally the previous version (loading screen only); and the pin's own failure direction is falling back to a fixed
+    // tier (the pre-adaptive shape) -- neither is ever worse than the status quo.
+    { static int pinning; static uint64_t pin_until; static int pin_src;   // pin_src：本次钉档见过的触发源并集（1 读取画面 / 2 面板），供解除日志区分来源 | union of the trigger sources seen during this pin episode (1 loading screen / 2 panel), so the release log line can name the source
+      int ls_up = g_nvn_loadscreen_up && g_nvn_loadscreen_up(), pn_up = g_nvn_panel_up && g_nvn_panel_up();
+      if (ls_up || pn_up) {
+          pin_until = now + 5000000000ull;
+          if (!pinning) { pinning = 1; pin_src = 0; LOG("[nvn] 出图档：状态切换期间钉住 %.1f FPS（触发源 %s；不判升降档，源撤下后 5 秒恢复判档）", screen_hz / g_pa_k, (ls_up && pn_up) ? "读取画面+面板" : ls_up ? "读取画面" : "面板"); }
+          pin_src |= (ls_up ? 1 : 0) | (pn_up ? 2 : 0);
+      }
       if (pin_until && now < pin_until) {
-          if (!pinning) { pinning = 1; LOG("[nvn] 出图档：读取画面期间钉住 %.1f FPS（不判升降档，画面关后 5 秒恢复判档）", screen_hz / g_pa_k); }
           late0 = dm_present_late_count ? dm_present_late_count() : 0; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now;
           return;
       }
-      if (pinning) { pinning = 0; LOG("[nvn] 出图档：读取画面结束，恢复自适应判档（当前 %.1f FPS）", screen_hz / g_pa_k); } }
+      if (pinning) { pinning = 0; LOG("[nvn] 出图档：状态切换结束，恢复自适应判档（本次触发源 %s；当前 %.1f FPS）", pin_src == 3 ? "读取画面+面板" : pin_src == 2 ? "面板" : "读取画面", screen_hz / g_pa_k); } }
     uint64_t lc = dm_present_late_count ? dm_present_late_count() : 0;
     if (!dm_present_late_count && iv > per * 1.25) misses_local++;
     if (!stable_since) { stable_since = now; late0 = lc; }
@@ -1491,6 +1513,7 @@ static uint64_t present_period(const win_t *o) {
     return hz > 0 ? (uint64_t)(itv * 1e9 / hz) : 0;
 }
 int (*g_nvn_loadscreen_up)(void);   // 宿主登记：读取画面此刻是否开着（diag.c 订阅界面消息时填；图形单测里为空 = 不设闸） | host registration: whether the loading screen is up right now (filled in when diag.c subscribes to UI messages; null in graphics unit tests = no gate)
+int (*g_nvn_panel_up)(void);   // 宿主登记：受监测面板此刻是否有开着（diag.c 在 shotui_install 里填面板开合栈的缓存读数 dm_hud_stack_any；为空 = 没有面板源，钉档退回只看读取画面） | host registration: whether a monitored panel is open right now (diag.c fills it in shotui_install with the panel stack's cached reading, dm_hud_stack_any; null = no panel source, the pin falls back to the loading screen only)
 NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     (void)q; win_t *o = (win_t *)w; o->presents++;
     static uint64_t prev_in, prev_out, prev_pass, prev_draw;

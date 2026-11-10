@@ -2552,6 +2552,7 @@ int dm_ui_panel_resident(const char *name) {
 // Returns the stack reading: number of open non-resident panels; -1 when only the NPC dialog menu / speech box is open. The log text "[hud] 面板栈 ..." is kept as is (regression scripts match on it)
 enum { HUD_STACK_MAX = 64 };
 static struct { char name[64]; int open; } g_hud_stack[HUD_STACK_MAX];
+static _Atomic int g_hud_stack_reading;   // 栈读数的缓存（dm_hud_stack_msg 每条面板消息后刷新）：给跨线程读端（出图档的状态切换钉档，hle_nvn.c）用，只原子读、不碰栈本身 | Cached copy of the stack reading (refreshed by dm_hud_stack_msg after every panel message): for cross-thread readers (the present tier's state-transition pin, hle_nvn.c); atomic loads only, never touches the stack itself
 __attribute__((weak)) void dm_platform_menu_ready(void) {}   // 空的弱定义（不是弱声明）：苹果链接器要求弱引用链接时有定义；Vulkan 后端 / 鸿蒙平台层给强定义 | empty weak definitions (not declarations): Apple's linker needs a weak reference to resolve; the Vulkan backend / HarmonyOS platform give the strong ones
 static void hud_stack_update(const char *act, const char *arg) {
     // 读取画面撤下：清掉此刻在游戏面板树里已经看不见的记录（防只开不关的漏配），屏上还在的照记——
@@ -2608,8 +2609,10 @@ int dm_hud_stack_msg(const char *act, const char *arg) {
     // Encoded into the same number: dialog menu open with no other panel → -1 (the bottom bar does not yield, and navigation-mode hiding is waived)
     int n=0, dlg=0; for(int i=0;i<HUD_STACK_MAX;i++) { if(!strcmp(g_hud_stack[i].name,"NpcDialogPanel")||!strcmp(g_hud_stack[i].name,"ScrollSpeechPanel")) dlg|=g_hud_stack[i].open>0; else n+=g_hud_stack[i].open; }   // ScrollSpeechPanel = NPC 说话的滚动文字框（屏幕上方一小块），同样不挡底栏 | ScrollSpeechPanel = the scrolling text box of NPC speech (a small block at the top of the screen); it likewise does not block the bottom bar
     if(!n && dlg) n=-1;
+    atomic_store(&g_hud_stack_reading, n);
     return n;
 }
+int dm_hud_stack_any(void) { return atomic_load(&g_hud_stack_reading) > 0; }   // 此刻有没有受监测面板开着（栈读数 > 0；只开着对话菜单 / 说话框的 -1 不算，与栈自身口径一致）。第一条面板消息之前恒 0 = 没有面板源，读端据此退回「只看读取画面」，不会比没有这一路时更差 | Whether a monitored panel is open right now (stack reading > 0; the dialog / speech box only -1 does not count, matching the stack's own convention). Always 0 before the first panel message = no panel source; readers fall back to loading-screen-only, never worse than not having this source at all
 void dm_hud_stack_dump(void) { for (int i = 0; i < HUD_STACK_MAX; i++) if (g_hud_stack[i].open) fprintf(stderr, "%s×%d ", g_hud_stack[i].name, g_hud_stack[i].open); }   // 开着的记录（巡检日志用） | Records currently open (for the patrol log)
 static struct { char name[48]; int open; } g_pm[48];   // 界面消息上开着的非常驻面板 | Non-persistent panels that are open per the UI messages
 static void ui_panel_note(const char *act, const char *arg) {   // 界面消息回调里调（游戏主线程） | Called from the UI message callback (game main thread)
