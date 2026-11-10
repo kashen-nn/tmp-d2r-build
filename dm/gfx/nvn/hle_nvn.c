@@ -1158,6 +1158,32 @@ NVN(nvnWindowAcquireTexture, NVNwindowAcquireTextureResult, NVNwindow *w, NVNsyn
         static uint64_t rt_period; uint64_t period = present_period(o);
         if (period && rt_period != period) { rt_period = period; set_time_constraint(&g_rt_main, period); }
         rt_comp_tick(&g_rt_main, period);
+        // 时刻环位移重锚（boot-7 定版）：avail / pace 构造上至多领先 now 两个周期（节拍器目标一周期 + 出图再加一周期），
+        // 但换区收尾瞬间整环可被写歪到未来（实测 +13.5 s / +92 s），取图便在 sleep_until_ns(avail) 上一次睡死。
+        // 睡前若目标领先超过 4 个周期（合法界 2 周期的一倍余量），判定整环位移，一次性把该窗口时间基重锚回现在：
+        // pace = now、avail[i] = now + i×周期（全部槽位）；ticket[] 一字不动（pq 侧与时刻环独立、现场恒全排空），
+        // 节拍（g_link_*）与钉档不碰；多窗口时只重锚当前取图的这一个窗口。只钳这一次睡眠不行——环仍位移，
+        // 后续每帧取图都会再撞未来值；重锚一次即回到正常节拍语义，后续按既有流程继续（重锚后该张只晚 idx 个周期）。
+        // 最坏副作用：切换瞬间一帧画进尚在显示的贴图（一帧撕裂），量级同既有 STALL_NS 丢帧放行。
+        // Re-anchor of a displaced window time ring (pinned down by boot-7): by construction avail / pace lead now by at
+        // most two periods (one for the pacer target, one added at present), but at zone-transition teardown the whole
+        // ring can be written seconds into the future (measured +13.5 s / +92 s) and acquire then parks in one single
+        // sleep_until_ns(avail). If the sleep target leads by more than 4 periods (twice the legal bound), declare the
+        // ring displaced and re-anchor this window's time base once: pace = now, avail[i] = now + i*period (all slots);
+        // ticket[] is untouched (the pq side is independent of the time ring), and neither the display link (g_link_*)
+        // nor the tier pin is touched; with several windows only the one being acquired is re-anchored. Clamping only
+        // this one sleep would not do -- the ring would stay displaced and every later acquire would hit a future value
+        // again; one re-anchor restores normal pacing and the existing flow continues (the texture is then only idx
+        // periods out). Worst case: one torn frame at the transition, the same magnitude as the STALL_NS drop-frame release
+        if (wait && period) {
+            uint64_t base = now_ns(), lead = at > base ? at - base : 0;
+            if (lead > 4 * period) {
+                o->pace = base;
+                for (int i = 0; i < 4; i++) o->avail[i] = base + (uint64_t)i * period;
+                LOG("【红】[nvn] 取图时刻环位移：目标领先 %llu ms（上限 %llu ms），已重锚窗口时间基", (unsigned long long)(lead / 1000000), (unsigned long long)(4 * period / 1000000));
+                at = *idx < 4 ? o->avail[*idx] : 0; now = base; wait = at > now ? at - now : 0;
+            }
+        }
         if (mtl_link_active()) { if (!mtl_link_wait_tick(period ? 2 * period : 33333333ull) && wait) sleep_until_ns(at); }   // DM_PRESENT_LINK：节拍完全跟显示节拍（跑得快就等下一拍，落后立刻走）；自己的 60 Hz 时钟只作等不到节拍时的兜底 | DM_PRESENT_LINK: pacing fully follows the display link (wait for the next display-link tick when running fast, go immediately when behind); our own 60 Hz clock is only the fallback when no display-link tick arrives
         else if (wait) sleep_until_ns(at);
     } else {   // DM_DETCLOCK_PACE=1（画面闸门用）：客体时钟按帧走的同时，每帧墙钟不短于一个步长——帧数与游戏内时间确定，后台加载线程每帧至少有一个步长的墙钟可用； | DM_DETCLOCK_PACE=1 (used by the screenshot gate): while the guest clock advances per frame, each frame's wall clock is no shorter than one step -- frame count and in-game time are deterministic, and the background loading thread has at least one step of wall clock available per frame;
