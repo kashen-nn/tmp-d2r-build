@@ -6736,25 +6736,59 @@ uint64_t mtl_present(const tex_t *t, double period, const int crop[4]) {
     return tk;
 }
 // 丢弃期间不等：标志置上之后才入队的那一帧（出图线程正好走过了标志检查）没人取，等它就又卡住；它留给随后的 mtl_drain 清
-// 节拍模式下不无限等：见 STALL_NS 处的说明。只丢「还没被节拍取走」的帧，已在上屏途中的那张等它交给 GPU（同进后台的丢法）
+// 节拍模式下不无限等：见 STALL_NS 处的说明。还没被节拍取走的帧整段丢掉；已被取走、正在上屏的那张正常等它交给 GPU，
+// 但节拍静默满 STALL_NS 它仍未完成时同样按丢帧放行——切换边界（开面板 / 开读取画面）上节拍重构会吞掉在途帧的 GPU 完成回调，
+// 那一票再没人推进 g_pq_done，无界等就是永睡（boot-5 两份现场：一份 8.3 秒后被后续完成顺带推过而自愈，一份永不推进而冻死）
 // Do not wait during discard: the frame enqueued only after the flag was set (the present thread had just passed the flag check) has nobody to take it, and waiting for it would stall again; it is left for the following mtl_drain to clear
-// Do not wait indefinitely in display-link mode: see the note at STALL_NS. Only frames "not yet taken by the display link" are dropped; the one already on its way to the screen is waited for until handed to the GPU (same dropping as when entering the background)
+// Do not wait indefinitely in display-link mode: see the note at STALL_NS. Frames not yet taken by the display link are dropped as a whole;
+// a frame already taken and on its way to the screen is normally waited on until handed to the GPU, but if the display link has been silent for STALL_NS and it is still not done, it is released as a drop too --
+// at state-transition boundaries (opening a panel / the loading screen) the pacing rebuild swallows the in-flight frame's GPU completion callback, nobody ever advances g_pq_done past that ticket again, and an unbounded wait is a permanent sleep (the two boot-5 dumps: one self-healed 8.3 s later when a subsequent completion pushed past it, one never advanced and froze)
 void mtl_present_wait(uint64_t tk) {
     pthread_mutex_lock(&g_pq_mu);
     while (g_pq_done < tk && !atomic_load(&g_present_discard)) {
-        if (!g_link_owns_layer) { pthread_cond_wait(&g_pq_cv, &g_pq_mu); continue; }
-        if (g_pq_read >= tk) { pthread_cond_wait(&g_pq_cv, &g_pq_mu); continue; }   // 这张已被节拍取走、正在上屏：等它交给 GPU（GPU 完成回调会叫醒） | This one has already been taken by the display link and is being presented: wait for it to be handed to the GPU (the GPU completion callback will wake us)
         struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += (long)STALL_NS; if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        // 非节拍模式（出图线程自己取 drawable、在推 g_pq_done）：没有「节拍静默」这个断链信号，放行会破坏「后画的命令在 GPU 队列上排在那次 blit 之后」的归还序，
+        // 只把无界等换成同款 STALL_NS 定时等、醒了重查条件（顺带防丢广播），不丢帧放行
+        // Non-display-link mode (the present thread takes drawables itself and advances g_pq_done): there is no "display link gone silent" broken-chain signal here,
+        // and releasing would break the return ordering (commands drawn later must queue behind that blit on the GPU queue), so only turn the unbounded wait into the same STALL_NS timed wait and re-check the condition on wake (also guards against a lost broadcast); no drop-release in this branch
+        if (!g_link_owns_layer) { pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts); continue; }
         // 已认定在停顿里（节拍回来时回调先清 g_stall_t0、再记节拍时刻）：不再每帧白等 100 ms，直接丢，游戏按自己的节拍等待超时（约两拍）走
         // Already determined to be in a stall (when the display link comes back the callback first clears g_stall_t0, then records the display-link tick time): no longer wait 100 ms in vain every frame, drop directly, and the game proceeds by its own display-link wait timeout (about two ticks)
         if (!g_stall_t0 && (pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts) != ETIMEDOUT || g_pq_done >= tk)) continue;
         uint64_t now = now_ns(), last = __atomic_load_n(&g_link_tick_ns, __ATOMIC_RELAXED);
-        if (g_pq_read >= tk) continue;
-        if (now - last < STALL_NS) { pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts); continue; }   // 节拍还在走，只是这张还没轮到：接着等（有上限，不空转） | The display link is still running, it is just not this one's turn yet: keep waiting (bounded, no busy spinning)
-        uint64_t n = tk - g_pq_read;
-        for (uint64_t k = g_pq_read + 1; k <= tk; k++) g_pres[k % PRING] = (pres_ent){k, -1};
-        g_link_dropped += n; g_pq_read = tk;
-        while (g_pq_inflight) pthread_cond_wait(&g_pq_cv, &g_pq_mu);
+        if (g_pq_done >= tk) continue;   // 等的这段里完成回调到了（或被别处推进过）：回主循环判退出 | The completion arrived while waiting (or the watermark was advanced elsewhere): go back and re-check the loop condition
+        if (now - last < STALL_NS) { pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts); continue; }   // 节拍还在走，只是这张还没轮到 / 还在上屏途中：接着等（有上限，不空转） | The display link is still running, it is just not this one's turn yet / it is still on its way to the screen: keep waiting (bounded, no busy spinning)
+        // 节拍静默满 STALL_NS、这张仍未完成：推进链断了，按丢帧放行。两种形态共用下面的停顿记账、日志与抢救
+        // The display link has been silent for STALL_NS and this one is still not done: the advancement chain is broken, release it as a drop. Both shapes share the stall accounting, logging and rescue below
+        uint64_t n;
+        if (g_pq_read < tk) {   // 还没被节拍取走：整段排队帧丢掉（原兜底） | Not yet taken by the display link: drop the whole queued run (the original fallback)
+            n = tk - g_pq_read;
+            for (uint64_t k = g_pq_read + 1; k <= tk; k++) g_pres[k % PRING] = (pres_ent){k, -1};
+            g_link_dropped += n; g_pq_read = tk;
+            // 已提交给 GPU 的那几张等它们做完（完成回调会广播来叫醒）；但回调若也被吞，这里再无界等就是第二个永睡点：
+            // STALL_NS 内一张都没完成就按停顿往下走（还在陆续完成就继续等——等的都是真进展）
+            // Wait for the ones already committed to the GPU to finish (the completion callback broadcasts to wake us); but if the callbacks have been swallowed too, an unbounded wait here would be a second permanent sleep:
+            // if none completes within STALL_NS, proceed as a stall (keep waiting while completions are still arriving -- that is real progress)
+            uint64_t dt0 = now_ns(); int dinf = g_pq_inflight;
+            while (g_pq_inflight) {
+                struct timespec dts; clock_gettime(CLOCK_REALTIME, &dts); dts.tv_nsec += (long)STALL_NS; if (dts.tv_nsec >= 1000000000L) { dts.tv_sec++; dts.tv_nsec -= 1000000000L; }
+                pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &dts);
+                if (g_pq_inflight < dinf) { dinf = g_pq_inflight; dt0 = now_ns(); }
+                else if (now_ns() - dt0 >= STALL_NS) break;
+            }
+        } else {   // 已被节拍取走、正在上屏：这票的完成回调被吞了（见函数头注），把未完成的这几票（g_pq_done, tk] 一并按丢帧记账、推水位放行
+            // 票据不变量：票号只由 mtl_present 入队时 ++g_pq_in 产生；放行只在 g_pq_mu 内把完成水位单调推到 tk——水位越过后等待条件即不成立，同一票不会被重复放行；
+            // 后续取图等的仍是它自己那张贴图的上一次票号，票号空间与 g_pq_done / g_pq_read 的水位互不相干，不存在错位。这几票的 blit 都已提交进 GPU 队列，
+            // 游戏随后画的命令在队列上排在它们后面，交换链归还序不破。g_pq_inflight 不在这里动：它只在提交处 +1、完成回调里 −1，两边严格配对，
+            // 迟到的回调照常抵账；回调永不到达时它多记的正是那几张被吞的上屏，是「还在等回调」的实情，与本次放行无关
+            // Already taken by the display link and on its way to the screen: this ticket's completion callback was swallowed (see the note above the function); account the unfinished tickets (g_pq_done, tk] as drops and release by advancing the watermark
+            // Ticket invariants: ticket numbers are produced only by ++g_pq_in when mtl_present enqueues; the release only moves the done watermark monotonically to tk under g_pq_mu -- once the watermark has passed a ticket its wait condition no longer holds, so the same ticket is never released twice;
+            // a later acquire still waits on the previous ticket of its own texture, and the ticket space is independent of the g_pq_done / g_pq_read watermarks, so nothing can be misaligned. The blits of these tickets are all committed to the GPU queue,
+            // and the commands the game draws afterwards queue behind them, so the swapchain return ordering is intact. g_pq_inflight is not touched here: it is +1 only at commit and -1 only in the completion callback, strictly paired;
+            // a late callback still settles its account, and if a callback never arrives, what it over-counts is exactly those swallowed presents -- the truth of "still awaiting a callback", unrelated to this release
+            n = tk - g_pq_done;
+            g_link_dropped += n;
+        }
         if (g_pq_done < tk) g_pq_done = tk;
         pthread_cond_broadcast(&g_pq_cv);
         if (!g_stall_t0) { g_stall_t0 = last ? last : now; g_stall_drop = 0; g_stall_red = 0; g_stall_logged = 0; g_stall_n++; }
