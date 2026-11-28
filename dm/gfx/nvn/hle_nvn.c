@@ -1145,6 +1145,7 @@ static uint64_t g_pa_wait;   // 本帧取图里节拍等待（自适应出图档
 static _Atomic uint64_t g_pa_reanchor_total;   // 时刻环重锚总账（取图侧记）：判档每拍比对，变了就作废当前判档窗——重锚前后成批丢弃的帧是位移纠正的账，不是稳态负载 | Running total of window time-ring re-anchors (recorded on the acquire side): the tier judge compares it every tick and voids the current judging window when it moved -- the frames dropped in a batch around a re-anchor are the displacement correction's account, not steady-state load
 static uint64_t g_pa_slot_miss;   // 上屏口径的错过节拍总账（出图侧按真实上屏间隔记：被丢弃、或间隔超当前档周期 1.25 倍）：判档的真信号——平台丢弃计数看不见「迟到但仍上屏」的帧（实测一局丢弃约 102 次、迟到上屏 1144 帧，判档因此对忙段失明、全程挂假 60 掉到 21 帧） | Slot-miss total on the presented-interval basis (recorded on the present side from actual on-screen intervals: discarded, or an interval over 1.25x the current tier period): the tier judge's truthful signal -- the platform discard counter cannot see late-but-presented frames (measured: ~102 discards vs 1144 late presents in one session, which blinded the judge in busy scenes and held a fake 60 while delivered FPS fell to 21)
 static int g_pa_slot_live;   // 上屏间隔读数已到过（到过之后判档只认 g_pa_slot_miss 的增量） | Presented-interval readings have arrived (once live, the judge uses only g_pa_slot_miss deltas)
+static struct { const win_t *o; uint64_t per; } g_pace_per_tab[4];   // 各窗口上次见的出图周期（出图处周期一变就把该窗口节拍器目标清零重基线，见出图函数内说明） | Each window's last-seen present period (when a window's period changes, its pacer target is zeroed and re-based; see the present function)
 static uint64_t g_acq_wait_ns, g_pq_wait_ns;   // 取图里节拍等待 / 等出图队列归还的累计，出图时按帧记（一帧内可有多次取图） | Accumulated display-link wait / wait for the present queue to return inside acquire, recorded per frame at present (there can be several acquires within one frame)
 static uint64_t g_acq_calls;   // 取图调用总次数（看门狗取证：同停滞两份导出作差分，分「反复进入取图」与「单次死睡」） | Total acquire calls (watchdog forensics: differenced between two dumps of one stall, to tell "re-entering acquire again and again" from "parked in one single wait")
 static win_t *g_acq_win;   // 最近一次取图的窗口（看门狗取证打它的 avail / pace 原值） | Window of the most recent acquire (the watchdog dump prints its raw avail / pace values)
@@ -1419,7 +1420,7 @@ static void set_time_constraint_comp(rt_decl *d, uint64_t period_ns, uint64_t co
     LOG("[nvn] %s时间约束策略（周期 %.3f ms、计算 %.3f ms）%s", d->who, period_ns / 1e6, comp_ns / 1e6, kr == KERN_SUCCESS ? "已设" : "设置失败");
 }
 static int rt_comp_fixed_ms(void) { static int v = -2; if (v == -2) { const char *e = getenv("DM_RT_COMP"); v = e && *e && strcmp(e, "auto") ? atoi(e) : -1; } return v; }   // −1 = auto
-static void set_time_constraint(rt_decl *d, uint64_t period_ns) { int f = rt_comp_fixed_ms(); set_time_constraint_comp(d, period_ns, f > 0 ? (uint64_t)f * 1000000ull : 2000000ull); }   // 首次：固定值，或 auto 的起始值 2 ms | first time: the fixed value, or auto's starting value of 2 ms
+static void set_time_constraint(rt_decl *d, uint64_t period_ns) { int f = rt_comp_fixed_ms(); uint64_t carry = d->comp_ms > 0 ? (uint64_t)(d->comp_ms * 1000000.0) : 2000000ull; set_time_constraint_comp(d, period_ns, f > 0 ? (uint64_t)f * 1000000ull : carry); }   // 首次：固定值，或 auto 的起始值 2 ms；周期变更（判档升降档）时沿用已收敛的声明（set_time_constraint_comp 内钳到新周期的 0.9 倍），不再从 2 ms 重新收敛——起始值比实际低数倍的那几秒，系统会按声明把线程降级（5.4 装机日志实测：降 40 后两条线程都从 2.000 ms 重新爬） | First time: the fixed value, or auto's starting value of 2 ms; on a period change (tier step) carry over the converged declaration (clamped to 0.9x the new period inside set_time_constraint_comp) instead of re-converging from 2 ms -- for those seconds the declaration sits several times below the actual need and the system demotes the thread by it (measured on device with 5.4: after the step to 40 both threads restarted from 2.000 ms)
 // 每帧在取图处调：记本线程自上次以来的 CPU 时间；auto 模式下按 p90 重新声明
 // Called every frame at acquire: records this thread's CPU time since the last call; in auto mode re-declares based on p90
 static void rt_comp_tick(rt_decl *d, uint64_t period_ns) {   // 在被声明的那条线程上调（读本线程 CPU 时钟） | Call on the thread being declared (reads this thread's CPU clock)
@@ -1535,6 +1536,7 @@ static void pace_adapt_tick(double screen_hz) {
     static nvn_adaptive_dropgate dropgate;   // 降档两窗确认的开案状态（nvn_adaptive_pace.h） | Open-case state for the two-window step-down confirmation (nvn_adaptive_pace.h)
     static uint64_t reanchor_seen;   // 上一拍见过的重锚总账；与 g_pa_reanchor_total 不等 = 本窗被重锚污染，作废 | Re-anchor total seen on the previous tick; differing from g_pa_reanchor_total means this window was polluted by a re-anchor and is voided
     static uint64_t slot0;   // 本窗起点 g_pa_slot_miss 的基线（与 late0 同步对齐） | This window's baseline of g_pa_slot_miss (aligned together with late0)
+    static int cur_tainted;   // 本窗是在重锚放行（防停摆）下判完的：错过帧是环位移的账、不是负载的账，不作降档依据 | The current window is being judged to completion under the re-anchor holdoff: its misses are the ring displacement's account, not the load's, and must not ground a step-down
     static unsigned ra_voids; static int ra_holdoff;   // 防停摆：ra_voids = 连续作废次数（额度 3）；ra_holdoff = 额度用尽后的放行闩，闩住期间重锚不再作废、直到有一窗完整判完才清零 | Anti-stall: ra_voids counts consecutive voids (budget 3); ra_holdoff is the pass-through latch once the budget is spent -- while latched, re-anchors no longer void, until one window is judged to completion and both clear
     // 状态切换边界钉档（3.1 回归修复；窗口由「读取画面」扩到全部状态切换边界）：三局卡死都落在客机状态切换的边界上——
     // boot-2 在加载完成侧、boot-3 在加载未完成侧、boot-4 在城镇里关技能树/暂停面板后约 2 秒（距上次读取画面约 60 秒、且那次加载
@@ -1571,7 +1573,7 @@ static void pace_adapt_tick(double screen_hz) {
           pin_src |= (ls_up ? 1 : 0) | (pn_up ? 2 : 0);
       }
       if (pin_until && now < pin_until) {
-          late0 = dm_present_late_count ? dm_present_late_count() : 0; slot0 = g_pa_slot_miss; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now; nvn_adaptive_drop_reset(&dropgate); ra_voids = 0; ra_holdoff = 0;
+          late0 = dm_present_late_count ? dm_present_late_count() : 0; slot0 = g_pa_slot_miss; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now; nvn_adaptive_drop_reset(&dropgate); ra_voids = 0; ra_holdoff = 0; cur_tainted = 0;
           return;
       }
       if (pinning) { pinning = 0; LOG("[nvn] 出图档：状态切换结束，恢复自适应判档（本次触发源 %s；当前 %.1f FPS）", pin_src == 3 ? "读取画面+面板" : pin_src == 2 ? "面板" : "读取画面", screen_hz / g_pa_k); } }
@@ -1593,11 +1595,11 @@ static void pace_adapt_tick(double screen_hz) {
       if (ra != reanchor_seen) {
           reanchor_seen = ra;
           if (!ra_holdoff) {
-              if (ra_voids >= 3) { ra_holdoff = 1; LOG("[nvn] 出图档：重锚连续作废已达 3 次，本窗起放行判完（防判档停摆）"); }
+              if (ra_voids >= 3) { ra_holdoff = 1; cur_tainted = 1; LOG("[nvn] 出图档：重锚连续作废已达 3 次，本窗起放行判完（防判档停摆）"); }
               else { if (wn) LOG("[nvn] 出图档：重锚作废当前判档窗（已计 %u 帧，连续第 %u 次）", wn, ra_voids + 1);
                      ra_voids++; late0 = dm_present_late_count ? dm_present_late_count() : 0; slot0 = g_pa_slot_miss; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now;
-                     nvn_adaptive_drop_reset(&dropgate); }
-          }
+                     nvn_adaptive_drop_reset(&dropgate); cur_tainted = 0; }
+          } else cur_tainted = 1;   // 放行期间又重锚：本窗的错过账含环位移的份，判完时标污 | Another re-anchor while latched: this window's miss account includes the ring displacement's share -- mark it tainted for the verdict
       } }
     uint64_t lc = dm_present_late_count ? dm_present_late_count() : 0;
     if (!dm_present_late_count && iv > per * 1.25) misses_local++;
@@ -1607,12 +1609,14 @@ static void pace_adapt_tick(double screen_hz) {
     ra_voids = 0; ra_holdoff = 0;   // 有一窗完整判完：作废额度与放行闩一并恢复 | A window was judged to completion: the void budget and the holdoff latch both reset
     unsigned misses = g_pa_slot_live ? (unsigned)(g_pa_slot_miss - slot0) : (dm_present_late_count ? (unsigned)(lc - late0) : misses_local); wn = 0; late0 = lc; slot0 = g_pa_slot_miss; misses_local = 0;
     int th = dm_thermal_now();   // 温控（0 名义 / 1 轻 / 2 重 / 3 危）：≥2 不再试升（越试越热）、≥3 主动降一档降温 | Thermal state (0 nominal / 1 fair / 2 serious / 3 critical): at >= 2 stop probing up (probing only adds heat), at >= 3 step down one tier proactively to cool off
+    int tainted = cur_tainted; cur_tainted = 0; if (tainted) nvn_adaptive_drop_reset(&dropgate);   // 污窗（重锚放行下判完）：错过账含环位移的份，降档闸结案、本窗不作降档依据（试升判失败照旧——退回永远安全） | Tainted window (judged under the re-anchor holdoff): its misses include the ring displacement's share, so close the drop-gate case and bar step-downs from it (probe-failure reverts still apply -- reverting is always safe)
     if (probing) {
         probing = 0; stable_since = now; nvn_adaptive_drop_reset(&dropgate);
         if (misses >= 4 && g_pa_k < kmax) { g_pa_k++; backoff = backoff * 2 > 60000000000ull ? 60000000000ull : backoff * 2; LOG("[nvn] 出图档 试升失败，退回 %.1f FPS（60 帧错过 %u 帧；下次 %.0f s 后再试）", screen_hz / g_pa_k, misses, backoff / 1e9); }
         else { backoff = 3000000000ull; LOG("[nvn] 出图档 ↑ %.1f FPS 站稳（60 帧错过 %u 帧；游戏 %.1f / 翻译 %.1f / GPU %.1f ms）", screen_hz / g_pa_k, misses, g_pa_ema, cm, gm); }
-    } else if (th >= 3 && g_pa_k < kmax) { g_pa_k++; stable_since = now; nvn_adaptive_drop_reset(&dropgate); LOG("[nvn] 出图档 ↓ %.1f FPS（温控 %d 主动降档降温；本窗 60 帧错过 %u 帧）", screen_hz / g_pa_k, th, misses); }
-    else if (g_pa_k < kmax && nvn_adaptive_drop_verdict(&dropgate, misses)) { g_pa_k++; stable_since = now; LOG("[nvn] 出图档 ↓ %.1f FPS（连续两窗超标，本窗 60 帧错过 %u 帧；游戏 %.1f / 翻译 %.1f / GPU %.1f ms）", screen_hz / g_pa_k, misses, g_pa_ema, cm, gm); }
+    } else if (th >= 3 && !tainted && g_pa_k < kmax) { g_pa_k++; stable_since = now; nvn_adaptive_drop_reset(&dropgate); LOG("[nvn] 出图档 ↓ %.1f FPS（温控 %d 主动降档降温；本窗 60 帧错过 %u 帧）", screen_hz / g_pa_k, th, misses); }
+    else if (!tainted && g_pa_k < kmax && nvn_adaptive_drop_verdict(&dropgate, misses)) { g_pa_k++; stable_since = now; LOG("[nvn] 出图档 ↓ %.1f FPS（连续两窗超标，本窗 60 帧错过 %u 帧；游戏 %.1f / 翻译 %.1f / GPU %.1f ms）", screen_hz / g_pa_k, misses, g_pa_ema, cm, gm); }
+    else if (tainted && misses >= 6) { LOG("[nvn] 出图档：本窗在重锚放行下判完（60 帧错过 %u 帧），环未稳，不作降档依据", misses); }
     else if (g_pa_k < kmax && misses >= 6) { LOG("[nvn] 出图档：本窗 60 帧错过 %u 帧超标（第 1 窗；再超一窗才降档；游戏 %.1f / 翻译 %.1f / GPU %.1f ms）", misses, g_pa_ema, cm, gm); }
     else if (g_pa_k > kmin && now - stable_since > backoff && th < 2) { g_pa_k--; probing = 1; skip = 20; nvn_adaptive_drop_reset(&dropgate); LOG("[nvn] 出图档 试升 %.1f FPS", screen_hz / g_pa_k); }
     (void)need; (void)per;
@@ -1739,6 +1743,23 @@ NVN(nvnQueuePresentTexture, void, NVNqueue *q, NVNwindow *w, int idx) {
     // Real-device semantics: present only enqueues and returns immediately; this frame's display time is scheduled by the pacer, and the texture can be acquired again only at "display time + one period" (blocking in AcquireTexture)
     if (g_hz_auto && !dm_detclock_enabled()) pace_adapt_tick(mtl_display_refresh());
     uint64_t period = present_period(o), now = dm_detclock_enabled() ? guest_ns() : now_ns();
+    // 周期一变（判档升降档 / 刷新率变化），本窗口节拍器目标清零、从现在重基线：旧目标是按旧周期步进攒出来的，
+    // 套上新步长后每帧再多领先一个步长差，十几帧就冲破「领先 ≤ 2 周期」的构造界，取图侧从此反复位移重锚、
+    // 整场再也正不回来（5.4 装机实测：降 40 后 62 次写出超前时刻、76 次判档窗作废、实际帧率掉到 10；
+    // 5.3 全程不换档则一次都没有，5.2 连环换档同样伴随 110 次重锚）。重基线后新节拍从现在起步，领先恒为 1 周期；
+    // 在飞的 avail 是旧周期的时刻、只会偏早不会偏晚，一轮内自然消化。win_t 是客体布局结构体不能加字段，故用侧表。
+    // When the period changes (a tier step or a refresh-rate change), zero this window's pacer target and re-base
+    // from now: the old target was accumulated in old-period steps, and stepping it by the new period adds the step
+    // difference as extra lead every frame -- within a dozen frames it breaks the "lead <= 2 periods" construction
+    // bound, the acquire side re-anchors forever, and the session never recovers (measured on device with 5.4:
+    // after the step to 40, 62 writer-side over-lead traces, 76 voided judging windows, delivered FPS down to 10;
+    // 5.3 never changed tier and had none, while 5.2's repeated tier changes came with 110 re-anchors). Re-based,
+    // the new cadence starts from now with a lead of exactly one period; in-flight avail entries hold old-period
+    // times that can only be early, never late, and drain within one swapchain round. win_t mirrors the guest
+    // layout and cannot grow a field, hence this side table.
+    if (period) { int s = -1, e = -1; for (int i = 0; i < 4; i++) { if (g_pace_per_tab[i].o == o) { s = i; break; } if (e < 0 && !g_pace_per_tab[i].o) e = i; }
+        if (s >= 0) { if (g_pace_per_tab[s].per != period) { o->pace = 0; g_pace_per_tab[s].per = period; } }
+        else if (e >= 0) { g_pace_per_tab[e].o = o; g_pace_per_tab[e].per = period; } }
     nvn_pacer pc = {o->pace};
     uint64_t slot = now + nvn_pace(&pc, now, period);
     o->pace = pc.target;
