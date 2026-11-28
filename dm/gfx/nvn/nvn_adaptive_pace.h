@@ -34,6 +34,8 @@ static inline int nvn_adaptive_divisor(double hz, int current, double old_hz) {
 // with >= 4 misses confirms the step down (the relaxed second bar shortens the delay under
 // genuine overload); any window with < 4 misses closes the case. Probe-up failure keeps its
 // original rule and does not pass through this gate.
+// 注意：verdict 有副作用（推进状态机），每个判档窗只能调用一次。
+// Note: the verdict has side effects (it advances the state machine); call it exactly once per judging window.
 typedef struct { unsigned over_streak; } nvn_adaptive_dropgate;
 
 static inline int nvn_adaptive_drop_verdict(nvn_adaptive_dropgate *g, unsigned misses) {

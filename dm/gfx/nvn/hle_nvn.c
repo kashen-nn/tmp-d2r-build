@@ -1529,6 +1529,7 @@ static void pace_adapt_tick(double screen_hz) {
     static unsigned wn, skip, misses_local; static int probing; static uint64_t late0, stable_since, backoff = 3000000000ull;
     static nvn_adaptive_dropgate dropgate;   // 降档两窗确认的开案状态（nvn_adaptive_pace.h） | Open-case state for the two-window step-down confirmation (nvn_adaptive_pace.h)
     static uint64_t reanchor_seen;   // 上一拍见过的重锚总账；与 g_pa_reanchor_total 不等 = 本窗被重锚污染，作废 | Re-anchor total seen on the previous tick; differing from g_pa_reanchor_total means this window was polluted by a re-anchor and is voided
+    static unsigned ra_voids; static int ra_holdoff;   // 防停摆：ra_voids = 连续作废次数（额度 3）；ra_holdoff = 额度用尽后的放行闩，闩住期间重锚不再作废、直到有一窗完整判完才清零 | Anti-stall: ra_voids counts consecutive voids (budget 3); ra_holdoff is the pass-through latch once the budget is spent -- while latched, re-anchors no longer void, until one window is judged to completion and both clear
     // 状态切换边界钉档（3.1 回归修复；窗口由「读取画面」扩到全部状态切换边界）：三局卡死都落在客机状态切换的边界上——
     // boot-2 在加载完成侧、boot-3 在加载未完成侧、boot-4 在城镇里关技能树/暂停面板后约 2 秒（距上次读取画面约 60 秒、且那次加载
     // 正常完成）；稳定战斗与稳定停留从不冻。切换期间产帧天然成串不规则，判档窗口会跨着切换取数（合并丢弃全记进 misses），
@@ -1564,30 +1565,40 @@ static void pace_adapt_tick(double screen_hz) {
           pin_src |= (ls_up ? 1 : 0) | (pn_up ? 2 : 0);
       }
       if (pin_until && now < pin_until) {
-          late0 = dm_present_late_count ? dm_present_late_count() : 0; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now; nvn_adaptive_drop_reset(&dropgate);
+          late0 = dm_present_late_count ? dm_present_late_count() : 0; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now; nvn_adaptive_drop_reset(&dropgate); ra_voids = 0; ra_holdoff = 0;
           return;
       }
       if (pinning) { pinning = 0; LOG("[nvn] 出图档：状态切换结束，恢复自适应判档（本次触发源 %s；当前 %.1f FPS）", pin_src == 3 ? "读取画面+面板" : pin_src == 2 ? "面板" : "读取画面", screen_hz / g_pa_k); } }
     // 重锚作废判档窗：重锚是时刻环位移的一次性纠正，它前后出图队列成批合并丢弃的帧会记进本窗
     // 的错过账，把稳态撑得住的档误判下去（实测一局重锚 110 次，降档窗错过仅 7–10 帧）。每拍比对
     // 重锚总账：变了就按钉档同口径作废本窗（基线对齐当下、不留待判账目），降档闸一并结案。
+    // 防停摆额度：连续作废满 3 次后闩住放行——重锚连发时判档窗永远攒不满 60 帧，降档与试升会
+    // 无限期停摆；闩住期间重锚只对账不再作废，直到有一窗完整判完才恢复作废额度。
     // A re-anchor voids the judging window: it is a one-shot correction of a displaced time ring,
     // and the frames the present queue merge-drops around it land in this window's miss account,
     // voting down tiers that steady state can sustain (measured: 110 re-anchors in one session,
     // step-down windows at only 7-10 misses). Every tick compares the re-anchor total; when it
     // moved, void the window exactly like the pin does (baseline aligned to now, nothing left
-    // pending) and close any open drop-gate case.
+    // pending) and close any open drop-gate case. Anti-stall budget: after 3 consecutive voids the
+    // latch holds off further voiding -- under a re-anchor storm a judging window would never fill
+    // its 60 frames and step-downs/probes would stall indefinitely; while latched, re-anchors only
+    // reconcile the seen total, until one window is judged to completion and the budget restores.
     { uint64_t ra = atomic_load(&g_pa_reanchor_total);
       if (ra != reanchor_seen) {
-          if (reanchor_seen && wn) LOG("[nvn] 出图档：重锚作废当前判档窗（已计 %u 帧）", wn);
-          reanchor_seen = ra; late0 = dm_present_late_count ? dm_present_late_count() : 0; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now;
-          nvn_adaptive_drop_reset(&dropgate);
+          reanchor_seen = ra;
+          if (!ra_holdoff) {
+              if (ra_voids >= 3) { ra_holdoff = 1; LOG("[nvn] 出图档：重锚连续作废已达 3 次，本窗起放行判完（防判档停摆）"); }
+              else { if (wn) LOG("[nvn] 出图档：重锚作废当前判档窗（已计 %u 帧，连续第 %u 次）", wn, ra_voids + 1);
+                     ra_voids++; late0 = dm_present_late_count ? dm_present_late_count() : 0; wn = 0; misses_local = 0; skip = 0; probing = 0; stable_since = now;
+                     nvn_adaptive_drop_reset(&dropgate); }
+          }
       } }
     uint64_t lc = dm_present_late_count ? dm_present_late_count() : 0;
     if (!dm_present_late_count && iv > per * 1.25) misses_local++;
     if (!stable_since) { stable_since = now; late0 = lc; }
     if (skip) { skip--; late0 = lc; wn = 0; misses_local = 0; return; }
     if (++wn < 60) return;
+    ra_voids = 0; ra_holdoff = 0;   // 有一窗完整判完：作废额度与放行闩一并恢复 | A window was judged to completion: the void budget and the holdoff latch both reset
     unsigned misses = dm_present_late_count ? (unsigned)(lc - late0) : misses_local; wn = 0; late0 = lc; misses_local = 0;
     if (probing) {
         probing = 0; stable_since = now; nvn_adaptive_drop_reset(&dropgate);
