@@ -38,6 +38,23 @@ int adaptive_pace_test(void) {
     CHECK(cm == 7, "next window does not retain previous CPU load");
     CHECK(!nvn_frame_cpu_sample(&cpu, 1000, &cm), "counter reset starts a fresh window");
     CHECK(cpu.count == 0 && cpu.sum == 0, "counter reset clears partial load");
+
+    // 降档闸：突发污染的单窗不降；连续两窗才降（第二窗放宽到 4）；干净窗结案；复位清案。
+    // Drop gate: one burst-polluted window never steps down; two in a row do (the second at the
+    // relaxed bar of 4); a clean window closes the case; reset clears it.
+    nvn_adaptive_dropgate dg = {0};
+    CHECK(nvn_adaptive_drop_verdict(&dg, 8) == 0 && dg.over_streak == 1, "first dirty window only opens a case");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 3) == 0 && dg.over_streak == 0, "clean window closes the case");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 8) == 0 && dg.over_streak == 1, "case reopens on a new dirty window");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 4) == 1 && dg.over_streak == 0, "second window at the relaxed bar confirms the step down");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 9) == 0 && dg.over_streak == 1, "new case after a step down");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 10) == 1 && dg.over_streak == 0, "two hard windows confirm the step down");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 5) == 0 && dg.over_streak == 0, "a lone mid window opens nothing");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 7) == 0 && dg.over_streak == 1, "case opens again");
+    nvn_adaptive_drop_reset(&dg);
+    CHECK(dg.over_streak == 0, "reset clears the case");
+    CHECK(nvn_adaptive_drop_verdict(&dg, 7) == 0 && dg.over_streak == 1, "after reset the next dirty window is a first window again");
+    nvn_adaptive_drop_reset(&dg);
     return 0;
 }
 const char *adaptive_pace_failure(void) { return failure; }
